@@ -1,0 +1,25 @@
+[package]
+name = "lrzip-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+memmap2 = "0.9"
+rayon = "1.10"
+thiserror = "2.0"
+
+[dependencies.flate2]
+version = "1.0"
+default-features = false
+features = ["rust_backend"]
+
+[dependencies.xz2]
+version = "0.1"
+default-features = false
+features = ["static"]
+
+[dependencies.zstd]
+version = "0.13"
+default-features = false
