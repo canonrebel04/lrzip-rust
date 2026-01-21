@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 pub const MAGIC_LEN_V11: usize = 21;
+pub const SALT_LEN: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum MagicError {
@@ -16,6 +17,18 @@ pub enum RcdError {
     TooShort { needed: usize, available: usize },
     #[error("invalid chunk byte width: {0}")]
     InvalidChunkBytes(u8),
+}
+
+#[derive(Debug, Error)]
+pub enum BlockError {
+    #[error("block header too short: need {needed} bytes, have {available}")]
+    TooShort { needed: usize, available: usize },
+    #[error("invalid chunk byte width: {0}")]
+    InvalidChunkBytes(u8),
+    #[error("invalid next_head value: {0}")]
+    InvalidNextHead(u64),
+    #[error("excessive block headers walked ({0})")]
+    ExcessiveBlocks(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +181,16 @@ pub struct StreamHeader {
     pub next_head: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockHeader {
+    pub header_salt: Option<[u8; SALT_LEN]>,
+    pub ctype: u8,
+    pub compressed_len: u64,
+    pub uncompressed_len: u64,
+    pub next_head: u64,
+    pub has_block_salt: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RcdHeader {
     pub chunk_bytes: u8,
@@ -317,6 +340,153 @@ pub fn parse_rcd_header(
     ))
 }
 
+pub fn stream_header_len(chunk_bytes: u8, encrypted: bool) -> Result<usize, RcdError> {
+    if chunk_bytes == 0 || chunk_bytes > 8 {
+        return Err(RcdError::InvalidChunkBytes(chunk_bytes));
+    }
+    let val_len = if encrypted { 8 } else { chunk_bytes as usize };
+    let base = 1 + (val_len * 3);
+    Ok(if encrypted { SALT_LEN + base } else { base })
+}
+
+pub fn initial_pos_from_rcd(offset: usize, chunk_bytes: u8, encrypted: bool) -> Result<usize, RcdError> {
+    if chunk_bytes == 0 || chunk_bytes > 8 {
+        return Err(RcdError::InvalidChunkBytes(chunk_bytes));
+    }
+    Ok(offset + 2 + if encrypted { 0 } else { chunk_bytes as usize })
+}
+
+pub fn parse_block_header_at(
+    bytes: &[u8],
+    abs_offset: usize,
+    chunk_bytes: u8,
+    encrypted: bool,
+) -> Result<BlockHeader, BlockError> {
+    let val_len = if encrypted { 8 } else { chunk_bytes as usize };
+    let needed = abs_offset + (if encrypted { SALT_LEN } else { 0 }) + 1 + (val_len * 3);
+    if bytes.len() < needed {
+        return Err(BlockError::TooShort {
+            needed,
+            available: bytes.len(),
+        });
+    }
+
+    let header_salt = if encrypted {
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&bytes[abs_offset..abs_offset + SALT_LEN]);
+        Some(salt)
+    } else {
+        None
+    };
+
+    let mut cursor = abs_offset + if encrypted { SALT_LEN } else { 0 };
+    let ctype = bytes[cursor];
+    cursor += 1;
+    let compressed_len = read_var_le_block(bytes, cursor, val_len)?;
+    cursor += val_len;
+    let uncompressed_len = read_var_le_block(bytes, cursor, val_len)?;
+    cursor += val_len;
+    let next_head = read_var_le_block(bytes, cursor, val_len)?;
+
+    Ok(BlockHeader {
+        header_salt,
+        ctype,
+        compressed_len,
+        uncompressed_len,
+        next_head,
+        has_block_salt: encrypted,
+    })
+}
+
+pub fn walk_stream_blocks(
+    bytes: &[u8],
+    rcd_offset: usize,
+    stream_index: usize,
+    num_streams: usize,
+    encrypted: bool,
+    max_blocks: usize,
+) -> Result<Vec<(u64, BlockHeader)>, BlockError> {
+    let chunk_bytes = bytes.get(rcd_offset).copied().ok_or(BlockError::TooShort {
+        needed: rcd_offset + 1,
+        available: bytes.len(),
+    })?;
+
+    let initial_pos = initial_pos_from_rcd(rcd_offset, chunk_bytes, encrypted).map_err(|e| match e {
+        RcdError::TooShort { needed, available } => BlockError::TooShort { needed, available },
+        RcdError::InvalidChunkBytes(v) => BlockError::InvalidChunkBytes(v),
+    })?;
+
+    let header_len = stream_header_len(chunk_bytes, encrypted).map_err(|e| match e {
+        RcdError::TooShort { needed, available } => BlockError::TooShort { needed, available },
+        RcdError::InvalidChunkBytes(v) => BlockError::InvalidChunkBytes(v),
+    })?;
+
+    let stream_rel = (stream_index * header_len) as u64;
+    if stream_index >= num_streams {
+        return Err(BlockError::InvalidNextHead(stream_rel));
+    }
+
+    let mut out: Vec<(u64, BlockHeader)> = Vec::new();
+    let mut cur_rel = stream_rel;
+    let mut walked = 0usize;
+    loop {
+        if walked >= max_blocks {
+            return Err(BlockError::ExcessiveBlocks(walked));
+        }
+        walked += 1;
+
+        let abs = initial_pos
+            .checked_add(cur_rel as usize)
+            .ok_or(BlockError::InvalidNextHead(cur_rel))?;
+
+        let header = parse_block_header_at(bytes, abs, chunk_bytes, encrypted)?;
+
+        // Minimal sanity: data must exist (at least c_len bytes) after header (+ blocksalt if encrypted).
+        let data_start = abs
+            + header_len
+            + if encrypted { SALT_LEN } else { 0 };
+        let data_end = data_start
+            .checked_add(header.compressed_len as usize)
+            .ok_or(BlockError::InvalidNextHead(header.compressed_len))?;
+        if bytes.len() < data_end {
+            return Err(BlockError::TooShort {
+                needed: data_end,
+                available: bytes.len(),
+            });
+        }
+
+        if let Some((prev_rel, prev)) = out.last() {
+            let mut prev_min_next = *prev_rel;
+            prev_min_next = prev_min_next
+                .checked_add(header_len as u64)
+                .ok_or(BlockError::InvalidNextHead(*prev_rel))?;
+            if encrypted {
+                prev_min_next = prev_min_next
+                    .checked_add(SALT_LEN as u64)
+                    .ok_or(BlockError::InvalidNextHead(*prev_rel))?;
+            }
+            prev_min_next = prev_min_next
+                .checked_add(prev.compressed_len)
+                .ok_or(BlockError::InvalidNextHead(*prev_rel))?;
+            if cur_rel < prev_min_next {
+                return Err(BlockError::InvalidNextHead(cur_rel));
+            }
+        }
+
+        out.push((cur_rel, header));
+
+        if out.last().unwrap().1.next_head == 0 {
+            break;
+        }
+        if out.last().unwrap().1.next_head <= cur_rel {
+            return Err(BlockError::InvalidNextHead(out.last().unwrap().1.next_head));
+        }
+        cur_rel = out.last().unwrap().1.next_head;
+    }
+
+    Ok(out)
+}
+
 fn parse_filter(byte: u8, minor: u8) -> FilterSpec {
     if byte == 0 {
         return FilterSpec::None;
@@ -406,6 +576,19 @@ fn read_var_le(bytes: &[u8], offset: usize, len: usize) -> Result<u64, RcdError>
     let needed = offset + len;
     if bytes.len() < needed {
         return Err(RcdError::TooShort {
+            needed,
+            available: bytes.len(),
+        });
+    }
+    let mut buf = [0u8; 8];
+    buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_var_le_block(bytes: &[u8], offset: usize, len: usize) -> Result<u64, BlockError> {
+    let needed = offset + len;
+    if bytes.len() < needed {
+        return Err(BlockError::TooShort {
             needed,
             available: bytes.len(),
         });
