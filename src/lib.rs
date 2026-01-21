@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod format;
 pub mod pipeline;
 
 use anyhow::Result;
