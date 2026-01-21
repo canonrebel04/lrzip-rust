@@ -22,6 +22,9 @@ pub struct Args {
 
     #[arg(long = "no-mmap", default_value_t = false)]
     pub disable_mmap: bool,
+
+    #[arg(long = "info", default_value_t = false)]
+    pub info: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
