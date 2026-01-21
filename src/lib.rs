@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod format;
 pub mod pipeline;
+pub mod rzip;
 
 use anyhow::Result;
 
