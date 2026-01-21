@@ -454,4 +454,42 @@ mod tests {
         assert_eq!(rcd.streams[1].uncompressed_len, 0x1314);
         assert_eq!(rcd.streams[1].next_head, 0x1516);
     }
+
+    #[test]
+    fn parse_rcd_encrypted_two_streams() {
+        let mut data = Vec::new();
+        data.push(4);
+        data.push(0);
+
+        let salt_a = [0x10u8, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        data.extend_from_slice(&salt_a);
+        data.push(1);
+        data.extend_from_slice(&0x0102030405060708u64.to_le_bytes());
+        data.extend_from_slice(&0x1112131415161718u64.to_le_bytes());
+        data.extend_from_slice(&0x2122232425262728u64.to_le_bytes());
+
+        let salt_b = [0x20u8, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27];
+        data.extend_from_slice(&salt_b);
+        data.push(2);
+        data.extend_from_slice(&0x3132333435363738u64.to_le_bytes());
+        data.extend_from_slice(&0x4142434445464748u64.to_le_bytes());
+        data.extend_from_slice(&0x5152535455565758u64.to_le_bytes());
+
+        let (rcd, consumed) = parse_rcd_header(&data, 0, true, 2).expect("rcd");
+        assert_eq!(consumed, data.len());
+        assert_eq!(rcd.chunk_bytes, 4);
+        assert!(!rcd.is_last_chunk);
+        assert_eq!(rcd.chunk_size, None);
+        assert_eq!(rcd.streams.len(), 2);
+        assert_eq!(rcd.streams[0].header_salt, Some(salt_a));
+        assert_eq!(rcd.streams[0].ctype, 1);
+        assert_eq!(rcd.streams[0].compressed_len, 0x0102030405060708);
+        assert_eq!(rcd.streams[0].uncompressed_len, 0x1112131415161718);
+        assert_eq!(rcd.streams[0].next_head, 0x2122232425262728);
+        assert_eq!(rcd.streams[1].header_salt, Some(salt_b));
+        assert_eq!(rcd.streams[1].ctype, 2);
+        assert_eq!(rcd.streams[1].compressed_len, 0x3132333435363738);
+        assert_eq!(rcd.streams[1].uncompressed_len, 0x4142434445464748);
+        assert_eq!(rcd.streams[1].next_head, 0x5152535455565758);
+    }
 }
