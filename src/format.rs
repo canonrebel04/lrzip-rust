@@ -10,6 +10,14 @@ pub enum MagicError {
     InvalidSignature,
 }
 
+#[derive(Debug, Error)]
+pub enum RcdError {
+    #[error("rcd header too short: need {needed} bytes, have {available}")]
+    TooShort { needed: usize, available: usize },
+    #[error("invalid chunk byte width: {0}")]
+    InvalidChunkBytes(u8),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompressionLevels {
     pub rzip: u8,
@@ -133,6 +141,23 @@ pub struct MagicHeader {
     pub comment_len: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamHeader {
+    pub header_salt: Option<[u8; 8]>,
+    pub ctype: u8,
+    pub compressed_len: u64,
+    pub uncompressed_len: u64,
+    pub next_head: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcdHeader {
+    pub chunk_bytes: u8,
+    pub is_last_chunk: bool,
+    pub chunk_size: Option<u64>,
+    pub streams: Vec<StreamHeader>,
+}
+
 impl MagicHeader {
     pub fn parse(bytes: &[u8]) -> Result<Self, MagicError> {
         if bytes.len() < MAGIC_LEN_V11 {
@@ -187,6 +212,91 @@ impl MagicHeader {
             comment_len,
         })
     }
+}
+
+pub fn parse_rcd_header(
+    bytes: &[u8],
+    offset: usize,
+    encrypted: bool,
+    num_streams: usize,
+) -> Result<(RcdHeader, usize), RcdError> {
+    let needed = offset + 2;
+    if bytes.len() < needed {
+        return Err(RcdError::TooShort {
+            needed,
+            available: bytes.len(),
+        });
+    }
+
+    let chunk_bytes = bytes[offset];
+    if chunk_bytes == 0 || chunk_bytes > 8 {
+        return Err(RcdError::InvalidChunkBytes(chunk_bytes));
+    }
+    let is_last_chunk = bytes[offset + 1] != 0;
+    let mut cursor = offset + 2;
+
+    let chunk_size = if encrypted {
+        None
+    } else {
+        let val = read_var_le(bytes, cursor, chunk_bytes as usize)?;
+        cursor += chunk_bytes as usize;
+        Some(val)
+    };
+
+    let header_len = if encrypted { 8usize } else { chunk_bytes as usize };
+    let mut streams = Vec::with_capacity(num_streams);
+    for _ in 0..num_streams {
+        let header_salt = if encrypted {
+            let needed = cursor + 8;
+            if bytes.len() < needed {
+                return Err(RcdError::TooShort {
+                    needed,
+                    available: bytes.len(),
+                });
+            }
+            let mut salt = [0u8; 8];
+            salt.copy_from_slice(&bytes[cursor..cursor + 8]);
+            cursor += 8;
+            Some(salt)
+        } else {
+            None
+        };
+
+        let needed = cursor + 1 + (header_len * 3);
+        if bytes.len() < needed {
+            return Err(RcdError::TooShort {
+                needed,
+                available: bytes.len(),
+            });
+        }
+
+        let ctype = bytes[cursor];
+        cursor += 1;
+        let compressed_len = read_var_le(bytes, cursor, header_len)?;
+        cursor += header_len;
+        let uncompressed_len = read_var_le(bytes, cursor, header_len)?;
+        cursor += header_len;
+        let next_head = read_var_le(bytes, cursor, header_len)?;
+        cursor += header_len;
+
+        streams.push(StreamHeader {
+            header_salt,
+            ctype,
+            compressed_len,
+            uncompressed_len,
+            next_head,
+        });
+    }
+
+    Ok((
+        RcdHeader {
+            chunk_bytes,
+            is_last_chunk,
+            chunk_size,
+            streams,
+        },
+        cursor - offset,
+    ))
 }
 
 fn parse_filter(byte: u8, minor: u8) -> FilterSpec {
@@ -254,6 +364,19 @@ fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
     }
 }
 
+fn read_var_le(bytes: &[u8], offset: usize, len: usize) -> Result<u64, RcdError> {
+    let needed = offset + len;
+    if bytes.len() < needed {
+        return Err(RcdError::TooShort {
+            needed,
+            available: bytes.len(),
+        });
+    }
+    let mut buf = [0u8; 8];
+    buf[..len].copy_from_slice(&bytes[offset..offset + len]);
+    Ok(u64::from_le_bytes(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +420,38 @@ mod tests {
         let parsed = MagicHeader::parse(&magic).expect("parse magic");
         assert_eq!(parsed.compression, CompressionType::Zstd { strategy: 3 });
         assert_eq!(parsed.backend_props, BackendProps::Zstd { level: 10 });
+    }
+
+    #[test]
+    fn parse_rcd_unencrypted_two_streams() {
+        let mut data = Vec::new();
+        data.push(2);
+        data.push(1);
+        data.extend_from_slice(&0x1234u16.to_le_bytes());
+
+        data.push(1);
+        data.extend_from_slice(&0x0102u16.to_le_bytes());
+        data.extend_from_slice(&0x0304u16.to_le_bytes());
+        data.extend_from_slice(&0x0506u16.to_le_bytes());
+
+        data.push(2);
+        data.extend_from_slice(&0x1112u16.to_le_bytes());
+        data.extend_from_slice(&0x1314u16.to_le_bytes());
+        data.extend_from_slice(&0x1516u16.to_le_bytes());
+
+        let (rcd, consumed) = parse_rcd_header(&data, 0, false, 2).expect("rcd");
+        assert_eq!(consumed, data.len());
+        assert_eq!(rcd.chunk_bytes, 2);
+        assert!(rcd.is_last_chunk);
+        assert_eq!(rcd.chunk_size, Some(0x1234));
+        assert_eq!(rcd.streams.len(), 2);
+        assert_eq!(rcd.streams[0].ctype, 1);
+        assert_eq!(rcd.streams[0].compressed_len, 0x0102);
+        assert_eq!(rcd.streams[0].uncompressed_len, 0x0304);
+        assert_eq!(rcd.streams[0].next_head, 0x0506);
+        assert_eq!(rcd.streams[1].ctype, 2);
+        assert_eq!(rcd.streams[1].compressed_len, 0x1112);
+        assert_eq!(rcd.streams[1].uncompressed_len, 0x1314);
+        assert_eq!(rcd.streams[1].next_head, 0x1516);
     }
 }
