@@ -65,6 +65,24 @@ impl From<u8> for HashKind {
     }
 }
 
+pub const CRC32_LEN: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityLayout {
+    pub crc32_len: usize,
+    pub file_hash_len: Option<usize>,
+}
+
+impl IntegrityLayout {
+    pub fn from_hash(hash: HashKind) -> Self {
+        let file_hash_len = hash_len(hash);
+        IntegrityLayout {
+            crc32_len: CRC32_LEN,
+            file_hash_len,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionCode {
     Aes128,
@@ -364,6 +382,26 @@ fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
     }
 }
 
+fn hash_len(hash: HashKind) -> Option<usize> {
+    match hash {
+        HashKind::Crc => None,
+        HashKind::Md5 => Some(16),
+        HashKind::Ripemd => Some(20),
+        HashKind::Sha256 => Some(32),
+        HashKind::Sha384 => Some(48),
+        HashKind::Sha512 => Some(64),
+        HashKind::Sha3_256 => Some(32),
+        HashKind::Sha3_512 => Some(64),
+        HashKind::Shake128_16 => Some(16),
+        HashKind::Shake128_32 => Some(32),
+        HashKind::Shake128_64 => Some(64),
+        HashKind::Shake256_16 => Some(16),
+        HashKind::Shake256_32 => Some(32),
+        HashKind::Shake256_64 => Some(64),
+        HashKind::Unknown(_) => None,
+    }
+}
+
 fn read_var_le(bytes: &[u8], offset: usize, len: usize) -> Result<u64, RcdError> {
     let needed = offset + len;
     if bytes.len() < needed {
@@ -491,5 +529,30 @@ mod tests {
         assert_eq!(rcd.streams[1].compressed_len, 0x3132333435363738);
         assert_eq!(rcd.streams[1].uncompressed_len, 0x4142434445464748);
         assert_eq!(rcd.streams[1].next_head, 0x5152535455565758);
+    }
+
+    #[test]
+    fn integrity_layout_hash_lengths() {
+        assert_eq!(
+            IntegrityLayout::from_hash(HashKind::Crc),
+            IntegrityLayout {
+                crc32_len: 4,
+                file_hash_len: None
+            }
+        );
+        assert_eq!(
+            IntegrityLayout::from_hash(HashKind::Md5),
+            IntegrityLayout {
+                crc32_len: 4,
+                file_hash_len: Some(16)
+            }
+        );
+        assert_eq!(
+            IntegrityLayout::from_hash(HashKind::Sha512),
+            IntegrityLayout {
+                crc32_len: 4,
+                file_hash_len: Some(64)
+            }
+        );
     }
 }

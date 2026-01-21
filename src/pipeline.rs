@@ -5,8 +5,8 @@ use memmap2::Mmap;
 
 use crate::cli::Args;
 use crate::format::{
-    parse_rcd_header, BackendProps, CompressionType, FilterSpec, HashKind, MagicHeader,
-    MAGIC_LEN_V11,
+    parse_rcd_header, BackendProps, CompressionType, FilterSpec, HashKind, IntegrityLayout,
+    MagicHeader, MAGIC_LEN_V11,
 };
 
 enum InputData {
@@ -70,6 +70,11 @@ fn print_info(magic: &MagicHeader, rcd: &crate::format::RcdHeader) {
         None => println!("Expected size: encrypted"),
     }
     println!("Hash: {}", format_hash(magic.hash));
+    let integrity = IntegrityLayout::from_hash(magic.hash);
+    println!("CRC32 per block: {} bytes", integrity.crc32_len);
+    if let Some(len) = integrity.file_hash_len {
+        println!("File hash length: {} bytes", len);
+    }
     println!("Filter: {}", format_filter(magic.filter));
     println!("Compression: {}", format_compression(magic.compression));
     println!("Backend props: {}", format_backend_props(magic.backend_props));
