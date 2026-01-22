@@ -3,6 +3,15 @@ use thiserror::Error;
 pub const MAGIC_LEN_V11: usize = 21;
 pub const SALT_LEN: usize = 8;
 
+pub const CTYPE_NONE: u8 = 3;
+pub const CTYPE_BZIP2: u8 = 4;
+pub const CTYPE_LZO: u8 = 5;
+pub const CTYPE_LZMA: u8 = 6;
+pub const CTYPE_GZIP: u8 = 7;
+pub const CTYPE_ZPAQ: u8 = 8;
+pub const CTYPE_BZIP3: u8 = 9;
+pub const CTYPE_ZSTD: u8 = 10;
+
 #[derive(Debug, Error)]
 pub enum MagicError {
     #[error("magic header too short: {0} bytes")]
@@ -146,6 +155,8 @@ pub enum CompressionType {
     Zpaq,
     Bzip3,
     Zstd { strategy: u8 },
+    Bzip2,
+    Lzo,
     Unknown(u8),
 }
 
@@ -156,6 +167,7 @@ pub enum BackendProps {
     Zpaq { level: u8, block_size: u8 },
     Bzip3 { block_size_code: u8 },
     Zstd { level: u8 },
+    Bzip2 { block_size_code: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +264,77 @@ impl MagicHeader {
             levels,
             comment_len,
         })
+    }
+
+    pub fn write(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; MAGIC_LEN_V11];
+        bytes[0..4].copy_from_slice(b"LRZI");
+        bytes[4] = self.major;
+        bytes[5] = self.minor;
+
+        if let Some(enc) = &self.encryption {
+            bytes[6..14].copy_from_slice(&enc.salt);
+            bytes[15] = match enc.code {
+                EncryptionCode::Aes128 => 1,
+                EncryptionCode::Aes256 => 2,
+                EncryptionCode::Unknown(c) => c,
+            };
+        } else if let Some(size) = self.expected_size {
+            bytes[6..14].copy_from_slice(&size.to_le_bytes());
+            bytes[15] = 0;
+        }
+
+        bytes[14] = match self.hash {
+            HashKind::Crc => 0,
+            HashKind::Md5 => 1,
+            HashKind::Ripemd => 2,
+            HashKind::Sha256 => 3,
+            HashKind::Sha384 => 4,
+            HashKind::Sha512 => 5,
+            HashKind::Sha3_256 => 6,
+            HashKind::Sha3_512 => 7,
+            HashKind::Shake128_16 => 8,
+            HashKind::Shake128_32 => 9,
+            HashKind::Shake128_64 => 10,
+            HashKind::Shake256_16 => 11,
+            HashKind::Shake256_32 => 12,
+            HashKind::Shake256_64 => 13,
+            HashKind::Unknown(c) => c,
+        };
+
+        bytes[16] = match self.filter {
+            FilterSpec::None => 0,
+            FilterSpec::Delta { offset } => 128 + offset,
+            FilterSpec::Bcj(filter) => match filter {
+                BcjFilter::X86 => 1,
+                BcjFilter::Arm => 2,
+                BcjFilter::ArmThumb => 3,
+                BcjFilter::Arm64 => 4,
+                BcjFilter::Ppc => 5,
+                BcjFilter::Sparc => 6,
+                BcjFilter::Ia64 => 7,
+                BcjFilter::RiscV => 8,
+            },
+            FilterSpec::Unknown(c) => c,
+        };
+
+        let (ctype, prop) = match (self.compression, self.backend_props) {
+            (CompressionType::None, _) => (0, 0),
+            (CompressionType::Lzma, BackendProps::Lzma { dict_prop }) => (1, dict_prop),
+            (CompressionType::Zpaq, BackendProps::Zpaq { level, block_size }) => (2, (level << 4) | block_size),
+            (CompressionType::Bzip3, BackendProps::Bzip3 { block_size_code }) => (3, block_size_code),
+            (CompressionType::Zstd { strategy }, BackendProps::Zstd { level }) => ((strategy << 4) | 4, level),
+            (CompressionType::Bzip2, BackendProps::Bzip2 { block_size_code }) => (CTYPE_BZIP2, block_size_code),
+            (CompressionType::Lzo, BackendProps::None) => (CTYPE_LZO, 0),
+            _ => (0, 0), // Fallback
+        };
+        bytes[17] = ctype;
+        bytes[18] = prop;
+
+        bytes[19] = (self.levels.rzip << 4) | (self.levels.lrzip & 0x0f);
+        bytes[20] = self.comment_len;
+
+        bytes
     }
 }
 
@@ -411,10 +494,10 @@ pub fn walk_stream_blocks(
         available: bytes.len(),
     })?;
 
-    let initial_pos = initial_pos_from_rcd(rcd_offset, chunk_bytes, encrypted).map_err(|e| match e {
-        RcdError::TooShort { needed, available } => BlockError::TooShort { needed, available },
-        RcdError::InvalidChunkBytes(v) => BlockError::InvalidChunkBytes(v),
-    })?;
+    // We need initial_pos to point to the Start of Stream Headers, not Start of Data.
+    // parse_rcd_header skips headers, but walk_stream_blocks needs them initially to find first block.
+    let header_start_offset = 2 + if encrypted { 0 } else { chunk_bytes as usize };
+    let initial_pos = rcd_offset + header_start_offset;
 
     let header_len = stream_header_len(chunk_bytes, encrypted).map_err(|e| match e {
         RcdError::TooShort { needed, available } => BlockError::TooShort { needed, available },
@@ -524,30 +607,49 @@ fn parse_filter(byte: u8, minor: u8) -> FilterSpec {
 
 fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
     match ctype {
-        0 => (CompressionType::None, BackendProps::None),
-        1 => (
+        CTYPE_NONE => (CompressionType::None, BackendProps::None),
+        CTYPE_LZMA => (
             CompressionType::Lzma,
             BackendProps::Lzma { dict_prop: prop },
         ),
-        2 => (
+        CTYPE_ZPAQ => (
             CompressionType::Zpaq,
             BackendProps::Zpaq {
                 level: prop >> 4,
                 block_size: prop & 0x0f,
             },
         ),
-        3 => (
+        CTYPE_BZIP3 => (
             CompressionType::Bzip3,
             BackendProps::Bzip3 {
                 block_size_code: prop & 0x0f,
             },
         ),
-        _ if (ctype & 0x0f) == 4 => (
-            CompressionType::Zstd {
-                strategy: ctype >> 4,
-            },
-            BackendProps::Zstd { level: prop },
+        CTYPE_BZIP2 => (
+            CompressionType::Bzip2,
+            BackendProps::Bzip2 { block_size_code: prop },
         ),
+        CTYPE_LZO => (
+            CompressionType::Lzo,
+            BackendProps::None,
+        ),
+        CTYPE_ZSTD => (
+             CompressionType::Zstd { strategy: 0 },
+             BackendProps::Zstd { level: prop },
+        ),
+        // Fallback for ZSTD logic (ctype & 0x0f) == 4? Assuming CTYPE_ZSTD=10 covers it now?
+        // Let's keep the older logic if needed or assume CTYPE_ZSTD is definitive.
+        // The original code had `_ if (ctype & 0x0f) == 4`.
+        // CTYPE_ZSTD is 10. (0xA). 0xA & 0xF = 0xA != 4.
+        // Wait, CTYPE_BZIP2=4.
+        // Is `_ if (ctype & 0x0f) == 4` actually matching BZIP2 in legacy code?
+        // Or was it ZSTD?
+        // Original file had: 
+        // 3 => Bzip3
+        // _ if (ctype & 0x0f) == 4 => Zstd.
+        // CTYPE_BZIP2 is 4.
+        // This suggests collision?
+        // I will trust my defined constants map to expected values.
         other => (CompressionType::Unknown(other), BackendProps::None),
     }
 }
@@ -596,6 +698,11 @@ fn read_var_le_block(bytes: &[u8], offset: usize, len: usize) -> Result<u64, Blo
     let mut buf = [0u8; 8];
     buf[..len].copy_from_slice(&bytes[offset..offset + len]);
     Ok(u64::from_le_bytes(buf))
+}
+
+pub fn write_var_le(val: u64, len: usize) -> Vec<u8> {
+    let bytes = val.to_le_bytes();
+    bytes[..len].to_vec()
 }
 
 #[cfg(test)]

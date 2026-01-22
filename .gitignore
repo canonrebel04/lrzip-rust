@@ -1,1 +1,13 @@
 /target
+/target
+/compatibility_tests_tmp/
+/encryption_tests_tmp/
+*.lrz
+*.out
+*.hex
+*.txt.gzip.*
+*.txt.lzma.*
+*.txt.zstd.*
+test_*.txt
+test_*.lrz
+out_*.txt
