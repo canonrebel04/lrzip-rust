@@ -20,7 +20,7 @@ pub fn preprocess(input: &[u8], dxt_enabled: bool, deflate_enabled: bool) -> (Ve
         }
     }
 
-    (input.to_vec(), PreprocessKind::None)
+    (Vec::new(), PreprocessKind::None)
 }
 
 pub fn postprocess(input: &[u8]) -> Vec<u8> {
@@ -32,5 +32,5 @@ pub fn postprocess(input: &[u8]) -> Vec<u8> {
         return reconstructed;
     }
 
-    input.to_vec()
+    Vec::new()
 }

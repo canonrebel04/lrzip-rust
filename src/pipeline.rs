@@ -146,7 +146,9 @@ pub fn decompress(args: &Args) -> Result<()> {
         let (rcd, consumed) = parse_rcd_header(bytes, cursor, encrypted, 2)?;
         let rzip_chunk_data = decompress_chunk(&rcd, bytes, cursor, encrypted, args.encrypt.as_deref())?;
         let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
-        out_file.write_all(&postprocessed)?;
+        let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
+        out_file.write_all(write_data)?;
+
 
 
         
@@ -515,31 +517,32 @@ pub fn compress(args: &Args) -> Result<()> {
         .unwrap()
         .progress_chars("#>-"));
     
-    use rayon::prelude::*;
+    let mut md5_ctx = md5::Context::new();
 
-    let chunk_results: Result<Vec<Vec<u8>>> = chunk_map.chunks.par_iter().map(|chunk| {
+    for chunk in &chunk_map.chunks {
         let mut chunk_out = Vec::new();
         let hasher = crate::rzip::RollingHash::new();
         let mut table = crate::rzip::HashTable::new(rzip_config.level);
+        
+        let start = chunk.offset as usize;
+        let end = (chunk.offset + chunk.size) as usize;
+        md5_ctx.consume(&bytes[start..end]);
+
         compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &hasher, &mut table)?;
+        
+        if !args.benchmark {
+            out_file.write_all(&chunk_out)?;
+        }
         pb.inc(chunk.size);
-        Ok(chunk_out)
-    }).collect();
+    }
 
     pb.finish_with_message("Compression complete");
 
     if !args.benchmark {
-        for chunk_data in chunk_results? {
-            out_file.write_all(&chunk_data)?;
-        }
-
-        // Compute and write MD5 hash
-        let digest = md5::compute(bytes);
+        let digest = md5_ctx.finalize();
         out_file.write_all(&digest.0)?;
-    } else {
-        // Just consume results to ensure errors are propagated
-        for _ in chunk_results? {}
     }
+
 
     if !args.quiet {
         let final_size = out_file.metadata().map(|m| m.len()).unwrap_or(0);
