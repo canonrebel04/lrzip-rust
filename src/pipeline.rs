@@ -197,18 +197,21 @@ pub fn decompress(args: &Args) -> Result<()> {
             .collect()
     });
 
-    // Pass 3 (serial): hash, inverse-filter, postprocess, write, progress.
+    // Pass 3 (serial): inverse-filter, hash, postprocess, write, progress.
     for result in chunk_results {
         let (_, mut rzip_chunk_data) = result?;
-        // File MD5 covers the rzip stream as stored (== the compressor's
-        // preprocessed+filtered input), so hash before undoing the filter.
-        if let Some(ctx) = &mut md5_ctx {
-            ctx.consume(&rzip_chunk_data);
-        }
 
         // Undo the reversible pre-filter (x86 BCJ) if the archive used it.
+        // Applied per chunk with chunk-local positions — mirrors the
+        // compressor exactly.
         if magic.filter == FilterSpec::Bcj(BcjFilter::X86) {
             crate::filter::x86_convert(&mut rzip_chunk_data, false);
+        }
+
+        // File MD5 covers the unfiltered preprocessed stream (== the
+        // compressor's hashed input), so hash after undoing the filter.
+        if let Some(ctx) = &mut md5_ctx {
+            ctx.consume(&rzip_chunk_data);
         }
 
         let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
@@ -470,16 +473,10 @@ pub fn compress(args: &Args) -> Result<()> {
     };
 
     let raw_bytes = input_data.as_slice();
-    let (mut preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
-    // Reversible pre-filter before the rzip stage (x86 BCJ: makes call/jmp
-    // targets position-independent so identical code at different offsets
-    // dedupes across the long-range window).
-    if args.filter == crate::cli::Filter::X86 {
-        if preprocessed_buf.is_empty() {
-            preprocessed_buf = raw_bytes.to_vec();
-        }
-        crate::filter::x86_convert(&mut preprocessed_buf, true);
-    }
+    let (preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
+    // The x86 BCJ pre-filter is applied PER CHUNK inside
+    // compress_chunk_to_buffer (chunk-local positions, fresh state on both
+    // compress and decompress so encode/decode stay aligned).
     let bytes = if preprocessed_buf.is_empty() { raw_bytes } else { preprocessed_buf.as_slice() };
     let total_size = bytes.len() as u64;
 
@@ -656,7 +653,20 @@ fn compress_chunk_to_buffer(
     let start = chunk_spec.offset as usize;
     let end = (chunk_spec.offset + chunk_spec.size) as usize;
     let chunk_data = &full_data[start..end];
-    
+
+    // Apply the reversible x86 BCJ pre-filter to this chunk (chunk-local
+    // positions, fresh filter state). The decompressor mirrors this exactly
+    // per chunk, so encode/decode stay aligned. A copy is needed because the
+    // chunk slices the shared input mmap.
+    let mut owned_filtered;
+    let chunk_data = if args.filter == crate::cli::Filter::X86 {
+        owned_filtered = chunk_data.to_vec();
+        crate::filter::x86_convert(&mut owned_filtered, true);
+        &owned_filtered
+    } else {
+        chunk_data
+    };
+
     let mut crc_hasher = Hasher::new();
     crc_hasher.update(chunk_data);
     let chunk_crc = crc_hasher.finalize();
