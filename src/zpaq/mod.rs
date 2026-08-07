@@ -57,7 +57,8 @@ pub fn decompress(
     callback: Option<ProgressCallback>,
     userdata: *mut std::ffi::c_void,
 ) -> Vec<u8> {
-    let mut out = vec![0u8; expected_size];
+    let cap = (expected_size * 2).max(65536);
+    let mut out = vec![0u8; cap];
     let mut out_len: i64 = 0;
 
     unsafe {
@@ -75,3 +76,21 @@ pub fn decompress(
     out.truncate(out_len as usize);
     out
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zpaq_roundtrip() {
+        let data = b"Hello world! This is a test of ZPAQ compression in lrzip-rust.";
+        let compressed = compress(data, 3, None, std::ptr::null_mut());
+        assert!(!compressed.is_empty());
+        let decompressed = decompress(&compressed, data.len(), None, std::ptr::null_mut());
+        assert_eq!(data, &decompressed[..]);
+    }
+
+
+}
+

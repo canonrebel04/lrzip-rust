@@ -13,6 +13,10 @@ fn main() {
         .flag_if_supported("-mpclmul")
         .flag_if_supported("-msse4.2")
         .flag_if_supported("/arch:AVX2")
+        .define("NOJIT", None)
         .compile("zpaq");
+
+
+
 }
 

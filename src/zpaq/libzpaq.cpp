@@ -23,8 +23,10 @@ See libzpaq.h for additional documentation.
 */
 #if defined(__AVX2__)
 #include <immintrin.h>
+#include <wmmintrin.h>
 #define ZPAQ_AVX2 1
 #endif
+
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -32,6 +34,7 @@ See libzpaq.h for additional documentation.
 #if defined(__VPCLMULQDQ__) || defined(__PCLMUL__)
 #include <wmmintrin.h>
 #endif
+
 
 #include "libzpaq.h"
 #include <string.h>
@@ -2163,6 +2166,7 @@ size_t Predictor::find(Array<U8>& ht, int sizebits, U32 cxt) {
 #else
   size_t h0=(((cxt * 0xbf58476d1ce4e5b9ULL) >> 32) * 16) & (ht.size() - 16);
 #endif
+
   size_t h1 = h0 ^ 16;
   size_t h2 = h0 ^ 32;
 #ifdef _MSC_VER
@@ -2174,25 +2178,10 @@ size_t Predictor::find(Array<U8>& ht, int sizebits, U32 cxt) {
 #endif
 
 
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
-  __m128i target = _mm_set1_epi8(static_cast<char>(chk));
-  __m128i ctrl0 = _mm_load_si128(reinterpret_cast<const __m128i*>(&ht[h0]));
-  __m128i ctrl1 = _mm_load_si128(reinterpret_cast<const __m128i*>(&ht[h1]));
-  __m128i ctrl2 = _mm_load_si128(reinterpret_cast<const __m128i*>(&ht[h2]));
-
-  int mask0 = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl0, target));
-  if (mask0 & 1) return h0;
-
-  int mask1 = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl1, target));
-  if (mask1 & 1) return h1;
-
-  int mask2 = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl2, target));
-  if (mask2 & 1) return h2;
-#else
   if (ht[h0]==chk) return h0;
   if (ht[h1]==chk) return h1;
   if (ht[h2]==chk) return h2;
-#endif
+
   if (ht[h0+1]<=ht[h1+1] && ht[h0+1]<=ht[h2+1])
     return memset(&ht[h0], 0, 16), ht[h0]=chk, h0;
   else if (ht[h1+1]<ht[h2+1])

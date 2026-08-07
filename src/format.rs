@@ -607,8 +607,8 @@ fn parse_filter(byte: u8, minor: u8) -> FilterSpec {
 
 fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
     match ctype {
-        CTYPE_NONE => (CompressionType::None, BackendProps::None),
-        CTYPE_LZMA => (
+        0 | CTYPE_NONE => (CompressionType::None, BackendProps::None),
+        1 | CTYPE_LZMA => (
             CompressionType::Lzma,
             BackendProps::Lzma { dict_prop: prop },
         ),
@@ -637,22 +637,14 @@ fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
              CompressionType::Zstd { strategy: 0 },
              BackendProps::Zstd { level: prop },
         ),
-        // Fallback for ZSTD logic (ctype & 0x0f) == 4? Assuming CTYPE_ZSTD=10 covers it now?
-        // Let's keep the older logic if needed or assume CTYPE_ZSTD is definitive.
-        // The original code had `_ if (ctype & 0x0f) == 4`.
-        // CTYPE_ZSTD is 10. (0xA). 0xA & 0xF = 0xA != 4.
-        // Wait, CTYPE_BZIP2=4.
-        // Is `_ if (ctype & 0x0f) == 4` actually matching BZIP2 in legacy code?
-        // Or was it ZSTD?
-        // Original file had: 
-        // 3 => Bzip3
-        // _ if (ctype & 0x0f) == 4 => Zstd.
-        // CTYPE_BZIP2 is 4.
-        // This suggests collision?
-        // I will trust my defined constants map to expected values.
+        c if (c & 0x0f) == 4 && c != CTYPE_BZIP2 => (
+            CompressionType::Zstd { strategy: c >> 4 },
+            BackendProps::Zstd { level: prop },
+        ),
         other => (CompressionType::Unknown(other), BackendProps::None),
     }
 }
+
 
 fn hash_len(hash: HashKind) -> Option<usize> {
     match hash {
