@@ -21,7 +21,8 @@ fn main() {
     // they activate with -fopenmp (GCC/Clang) or /openmp (MSVC). The suffix
     // array is a deterministic sort result regardless of thread count, so
     // archives stay byte-identical. Set LRZIP_NOOPENMP=1 to force serial.
-    if std::env::var("LRZIP_NOOPENMP").is_err() {
+    let openmp = std::env::var("LRZIP_NOOPENMP").is_err();
+    if openmp {
         build.flag_if_supported("-fopenmp").flag_if_supported("/openmp");
     }
 
@@ -40,7 +41,11 @@ fn main() {
 
     build.compile("zpaq");
 
-
-
+    // GCC/Clang's -fopenmp does not propagate the OpenMP runtime to the
+    // final Rust link (MSVC's /openmp auto-links vcomp via the object).
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if openmp && !target.contains("windows-msvc") {
+        println!("cargo:rustc-link-lib=gomp");
+    }
 }
 
