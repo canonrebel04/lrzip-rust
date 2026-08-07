@@ -197,7 +197,7 @@ pub fn decompress(args: &Args) -> Result<()> {
             .collect()
     });
 
-    // Pass 3 (serial): inverse-filter, hash, postprocess, write, progress.
+    // Pass 3 (serial): inverse-filter, postprocess, hash raw, write, progress.
     for result in chunk_results {
         let (_, mut rzip_chunk_data) = result?;
 
@@ -208,18 +208,20 @@ pub fn decompress(args: &Args) -> Result<()> {
             crate::filter::x86_convert(&mut rzip_chunk_data, false);
         }
 
-        // File MD5 covers the unfiltered preprocessed stream (== the
-        // compressor's hashed input), so hash after undoing the filter.
-        if let Some(ctx) = &mut md5_ctx {
-            ctx.consume(&rzip_chunk_data);
-        }
-
+        // Undo the dxt/deflate preprocess if this chunk carries its marker.
         let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
         let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
+
+        // File MD5 covers the raw stream (== the compressor's hashed input),
+        // so hash the post-preprocess output.
+        if let Some(ctx) = &mut md5_ctx {
+            ctx.consume(write_data);
+        }
+
         out_file.write_all(write_data)?;
 
         if let Some(ref pb) = pb {
-            pb.inc(rzip_chunk_data.len() as u64);
+            pb.inc(write_data.len() as u64);
         }
     }
 
@@ -473,11 +475,11 @@ pub fn compress(args: &Args) -> Result<()> {
     };
 
     let raw_bytes = input_data.as_slice();
-    let (preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
-    // The x86 BCJ pre-filter is applied PER CHUNK inside
-    // compress_chunk_to_buffer (chunk-local positions, fresh state on both
-    // compress and decompress so encode/decode stay aligned).
-    let bytes = if preprocessed_buf.is_empty() { raw_bytes } else { preprocessed_buf.as_slice() };
+    // Preprocess (dxt/deflate) and the x86 BCJ filter are applied PER CHUNK
+    // inside compress_chunk_to_buffer — chunk-local, mirrored exactly by the
+    // decompressor (the whole-file/per-chunk split corrupted multi-chunk
+    // archives for the BCJ filter; same rule applies here).
+    let bytes = raw_bytes;
     let total_size = bytes.len() as u64;
 
 
@@ -652,20 +654,24 @@ fn compress_chunk_to_buffer(
 
     let start = chunk_spec.offset as usize;
     let end = (chunk_spec.offset + chunk_spec.size) as usize;
-    let chunk_data = &full_data[start..end];
+    let mut chunk_data = &full_data[start..end];
 
-    // Apply the reversible x86 BCJ pre-filter to this chunk (chunk-local
-    // positions, fresh filter state). The decompressor mirrors this exactly
-    // per chunk, so encode/decode stay aligned. A copy is needed because the
-    // chunk slices the shared input mmap.
-    let mut owned_filtered;
-    let chunk_data = if args.filter == crate::cli::Filter::X86 {
-        owned_filtered = chunk_data.to_vec();
-        crate::filter::x86_convert(&mut owned_filtered, true);
-        &owned_filtered
-    } else {
-        chunk_data
-    };
+    // Per-chunk preprocess (dxt/deflate) then x86 BCJ. Both are chunk-local
+    // with fresh state, mirrored exactly on decompress, so encode/decode
+    // stay aligned across chunk boundaries.
+    let mut chunk_data_owned: Option<Vec<u8>> = None;
+    let (buf, _kind) = crate::preprocess::preprocess(chunk_data, args.dxt, args.deflate_pre);
+    if !buf.is_empty() {
+        chunk_data_owned = Some(buf);
+        chunk_data = chunk_data_owned.as_ref().expect("just set");
+    }
+
+    if args.filter == crate::cli::Filter::X86 {
+        let mut filtered = chunk_data.to_vec();
+        crate::filter::x86_convert(&mut filtered, true);
+        chunk_data_owned = Some(filtered);
+        chunk_data = chunk_data_owned.as_ref().expect("just set");
+    }
 
     let mut crc_hasher = Hasher::new();
     crc_hasher.update(chunk_data);
