@@ -627,7 +627,9 @@ fn compress_chunk_to_buffer(
         Backend::Gzip => crate::format::CTYPE_GZIP,
         Backend::Zpaq => crate::format::CTYPE_ZPAQ,
         Backend::Bzip2 => crate::format::CTYPE_BZIP2,
+        Backend::Bzip3 => crate::format::CTYPE_BZIP3,
         Backend::Lzo => crate::format::CTYPE_LZO,
+        Backend::None => crate::format::CTYPE_NONE,
     };
     let s1_ctype = match args.get_backend() {
         Backend::Zstd => crate::format::CTYPE_ZSTD,
@@ -635,7 +637,9 @@ fn compress_chunk_to_buffer(
         Backend::Gzip => crate::format::CTYPE_GZIP,
         Backend::Zpaq => crate::format::CTYPE_ZPAQ,
         Backend::Bzip2 => crate::format::CTYPE_BZIP2,
+        Backend::Bzip3 => crate::format::CTYPE_BZIP3,
         Backend::Lzo => crate::format::CTYPE_LZO,
+        Backend::None => crate::format::CTYPE_NONE,
     };
 
     let control_compressed = match args.get_backend() {
@@ -674,10 +678,12 @@ fn compress_chunk_to_buffer(
             encoder.write_all(&control_stream)?;
             encoder.finish()?
         }
+        Backend::Bzip3 => control_stream.clone(),
         Backend::Lzo => {
             let mut lzo = minilzo_rs::LZO::init().map_err(|e| anyhow::anyhow!("lzo init error: {:?}", e))?;
             lzo.compress(&control_stream).map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
         }
+        Backend::None => control_stream.clone(),
     };
     let literal_compressed = match args.get_backend() {
         Backend::Zstd => zstd::encode_all(&literal_stream[..], 3)?,
@@ -715,11 +721,15 @@ fn compress_chunk_to_buffer(
             encoder.write_all(&literal_stream)?;
             encoder.finish()?
         }
+        Backend::Bzip3 => literal_stream.clone(),
         Backend::Lzo => {
             let mut lzo = minilzo_rs::LZO::init().map_err(|e| anyhow::anyhow!("lzo init error: {:?}", e))?;
             lzo.compress(&literal_stream).map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
         }
+        Backend::None => literal_stream.clone(),
     };
+
+
 
     let mut control_compressed = control_compressed;
     let mut literal_compressed = literal_compressed;

@@ -37,7 +37,9 @@ See libzpaq.h for additional documentation.
 #include <string.h>
 #include <string>
 #include <vector>
+#include <stdexcept>
 #include <stdio.h>
+
 
 #ifdef unix
 #ifndef NOJIT
@@ -50,7 +52,13 @@ See libzpaq.h for additional documentation.
 
 namespace libzpaq {
 
+void error(const char* msg) {
+  fprintf(stderr, "libzpaq error: %s\n", msg);
+  throw std::runtime_error(msg);
+}
+
 // Read 16 bit little-endian number
+
 int toU16(const char* p) {
   return (p[0]&255)+256*(p[1]&255);
 }
@@ -2155,10 +2163,17 @@ size_t Predictor::find(Array<U8>& ht, int sizebits, U32 cxt) {
 #else
   size_t h0=(((cxt * 0xbf58476d1ce4e5b9ULL) >> 32) * 16) & (ht.size() - 16);
 #endif
-  size_t h1=h0^16;
-  size_t h2=h0^32;
+  size_t h1 = h0 ^ 16;
+  size_t h2 = h0 ^ 32;
+#ifdef _MSC_VER
+  _mm_prefetch(reinterpret_cast<const char*>(&ht[h0]), _MM_HINT_T0);
+  _mm_prefetch(reinterpret_cast<const char*>(&ht[h1]), _MM_HINT_T0);
+#else
   __builtin_prefetch(&ht[h0], 0, 3);
   __builtin_prefetch(&ht[h1], 0, 3);
+#endif
+
+
 #if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
   __m128i target = _mm_set1_epi8(static_cast<char>(chk));
   __m128i ctrl0 = _mm_load_si128(reinterpret_cast<const __m128i*>(&ht[h0]));
@@ -7830,3 +7845,49 @@ void compressBlock(StringBuffer* in, Writer* out, const char* method_,
 }
 
 }  // end namespace libzpaq
+
+extern "C" {
+
+void zpaq_compress(
+    unsigned char *c_buf,
+    int64_t *c_len,
+    const unsigned char *s_buf,
+    int64_t s_len,
+    int level,
+    void (*callback)(int, int64_t, void*),
+    void *userdata,
+    int64_t thread
+) {
+    libzpaq::StringBuffer in, out;
+    in.write((const char*)s_buf, s_len);
+    
+    char method[16];
+    snprintf(method, sizeof(method), "%d", level);
+    libzpaq::compress(&in, &out, method);
+    
+    int64_t out_len = out.size();
+    memcpy(c_buf, out.data(), out_len);
+    *c_len = out_len;
+}
+
+void zpaq_decompress(
+    unsigned char *s_buf,
+    int64_t *d_len,
+    const unsigned char *c_buf,
+    int64_t c_len,
+    void (*callback)(int, int64_t, void*),
+    void *userdata,
+    int64_t thread
+) {
+    libzpaq::StringBuffer in, out;
+    in.write((const char*)c_buf, c_len);
+    
+    libzpaq::decompress(&in, &out);
+    
+    int64_t out_len = out.size();
+    memcpy(s_buf, out.data(), out_len);
+    *d_len = out_len;
+}
+
+} // extern "C"
+
