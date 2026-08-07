@@ -11,3 +11,10 @@
 test_*.txt
 test_*.lrz
 out_*.txt
+
+# Codegraph index
+.codegraph/
+
+# Release artifacts
+*.zip
+*.tar.gz

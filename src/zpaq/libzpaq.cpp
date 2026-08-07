@@ -7859,6 +7859,29 @@ void zpaq_compress(
     *c_len = out_len;
 }
 
+// Method-string variant: passes an arbitrary zpaq method (e.g. a level digit
+// 0-9, or an advanced config like "x6.2.12.0.7.27.1c0,0,511i2") straight to
+// libzpaq::compress. Used by --method passthrough.
+void zpaq_compress_method(
+    unsigned char *c_buf,
+    int64_t *c_len,
+    const unsigned char *s_buf,
+    int64_t s_len,
+    const char *method,
+    void (*callback)(int, int64_t, void*),
+    void *userdata,
+    int64_t thread
+) {
+    libzpaq::StringBuffer in, out;
+    in.write((const char*)s_buf, s_len);
+    
+    libzpaq::compress(&in, &out, method);
+    
+    int64_t out_len = out.size();
+    memcpy(c_buf, out.data(), out_len);
+    *c_len = out_len;
+}
+
 void zpaq_decompress(
     unsigned char *s_buf,
     int64_t *d_len,

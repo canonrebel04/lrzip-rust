@@ -13,6 +13,15 @@ pub enum Backend {
     None,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    None,
+    /// x86 BCJ (E8/E9) branch converter — makes call/jmp targets
+    /// position-independent so identical code sequences dedupe across the
+    /// rzip long-range window. Best on PE/DLL/exe-heavy data.
+    X86,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "lrzip-rust", version = "0.15.0", about = "High Performance Rust rewrite of lrzip-next v0.15.0")]
 pub struct Args {
@@ -95,6 +104,16 @@ pub struct Args {
     /// Set compression level (1-9)
     #[arg(short = 'L', long = "level", value_name = "LEVEL")]
     pub level: Option<u8>,
+
+    /// ZPAQ advanced method string passthrough (overrides -L for the zpaq backend).
+    /// Level digits 1-5 are built-ins; 6-9 expand to the level-5 model.
+    /// Example: --method "x6.2.12.0.7.27.1c0,0,511i2"
+    #[arg(long = "method", value_name = "METHOD")]
+    pub method: Option<String>,
+
+    /// Reversible pre-filter applied before the rzip stage.
+    #[arg(long = "filter", value_enum, default_value_t = Filter::None)]
+    pub filter: Filter,
 
     /// Set window size in bytes (e.g. 100 or 100k or 100m)
     #[arg(short = 'w', long = "window", value_name = "WINDOW")]

@@ -10,8 +10,8 @@ use rayon::prelude::*;
 
 use crate::cli::{Args, Backend};
 use crate::format::{
-    parse_rcd_header, BackendProps, CompressionLevels, CompressionType, FilterSpec, HashKind,
-    IntegrityLayout, MagicHeader, MAGIC_LEN_V11, EncryptionInfo, EncryptionCode,
+    parse_rcd_header, BackendProps, BcjFilter, CompressionLevels, CompressionType, FilterSpec,
+    HashKind, IntegrityLayout, MagicHeader, MAGIC_LEN_V11, EncryptionInfo, EncryptionCode,
 };
 use crate::encryption::EncryptionEngine;
 use crate::ui;
@@ -197,16 +197,23 @@ pub fn decompress(args: &Args) -> Result<()> {
             .collect()
     });
 
-    // Pass 3 (serial): postprocess, write, hash, and progress in chunk order.
+    // Pass 3 (serial): hash, inverse-filter, postprocess, write, progress.
     for result in chunk_results {
-        let (_, rzip_chunk_data) = result?;
-        let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
-        let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
-        out_file.write_all(write_data)?;
-
+        let (_, mut rzip_chunk_data) = result?;
+        // File MD5 covers the rzip stream as stored (== the compressor's
+        // preprocessed+filtered input), so hash before undoing the filter.
         if let Some(ctx) = &mut md5_ctx {
             ctx.consume(&rzip_chunk_data);
         }
+
+        // Undo the reversible pre-filter (x86 BCJ) if the archive used it.
+        if magic.filter == FilterSpec::Bcj(BcjFilter::X86) {
+            crate::filter::x86_convert(&mut rzip_chunk_data, false);
+        }
+
+        let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
+        let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
+        out_file.write_all(write_data)?;
 
         if let Some(ref pb) = pb {
             pb.inc(rzip_chunk_data.len() as u64);
@@ -463,7 +470,16 @@ pub fn compress(args: &Args) -> Result<()> {
     };
 
     let raw_bytes = input_data.as_slice();
-    let (preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
+    let (mut preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
+    // Reversible pre-filter before the rzip stage (x86 BCJ: makes call/jmp
+    // targets position-independent so identical code at different offsets
+    // dedupes across the long-range window).
+    if args.filter == crate::cli::Filter::X86 {
+        if preprocessed_buf.is_empty() {
+            preprocessed_buf = raw_bytes.to_vec();
+        }
+        crate::filter::x86_convert(&mut preprocessed_buf, true);
+    }
     let bytes = if preprocessed_buf.is_empty() { raw_bytes } else { preprocessed_buf.as_slice() };
     let total_size = bytes.len() as u64;
 
@@ -500,7 +516,10 @@ pub fn compress(args: &Args) -> Result<()> {
             None
         },
         hash: HashKind::Md5,
-        filter: FilterSpec::None,
+        filter: match args.filter {
+            crate::cli::Filter::X86 => FilterSpec::Bcj(BcjFilter::X86),
+            crate::cli::Filter::None => FilterSpec::None,
+        },
         compression: match args.get_backend() {
             Backend::Lzma => CompressionType::Lzma,
             Backend::Gzip => CompressionType::Unknown(7), // Map Gzip
@@ -515,7 +534,19 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::Lzma => BackendProps::Lzma { dict_prop: 0x2d },
             Backend::Gzip => BackendProps::Zstd { level: 3 },
             Backend::Zstd => BackendProps::Zstd { level: 3 },
-            Backend::Zpaq => BackendProps::Zpaq { level: args.level.unwrap_or(3), block_size: 0 },
+            // Header level: explicit -L wins; else derive from --method's
+            // leading digit when present; else default 3.
+            Backend::Zpaq => BackendProps::Zpaq {
+                level: args.level.unwrap_or_else(|| {
+                    args.method
+                        .as_deref()
+                        .and_then(|m| m.chars().next())
+                        .and_then(|c| c.to_digit(10))
+                        .map(|l| l as u8)
+                        .unwrap_or(3)
+                }),
+                block_size: 0,
+            },
             Backend::Bzip2 => BackendProps::Bzip2 { block_size_code: 9 }, // Default block 9
             Backend::Bzip3 => BackendProps::Bzip3 { block_size_code: 14 },
             Backend::Lzo => BackendProps::None,
@@ -733,7 +764,11 @@ fn compress_chunk_to_buffer(
             encoder.finish()?
         }
         Backend::Zpaq => {
-            crate::zpaq::compress(&control_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+            if let Some(method) = &args.method {
+                crate::zpaq::compress_method(&control_stream, method, None, std::ptr::null_mut())
+            } else {
+                crate::zpaq::compress(&control_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+            }
         }
         Backend::Bzip2 => {
             let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
@@ -776,7 +811,11 @@ fn compress_chunk_to_buffer(
             encoder.finish()?
         }
         Backend::Zpaq => {
-            crate::zpaq::compress(&literal_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+            if let Some(method) = &args.method {
+                crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())
+            } else {
+                crate::zpaq::compress(&literal_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+            }
         }
         Backend::Bzip2 => {
             let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());

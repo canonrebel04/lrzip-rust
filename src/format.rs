@@ -612,7 +612,9 @@ fn parse_compression(ctype: u8, prop: u8) -> (CompressionType, BackendProps) {
             CompressionType::Lzma,
             BackendProps::Lzma { dict_prop: prop },
         ),
-        CTYPE_ZPAQ => (
+        // Magic header byte 17: writer emits 2 for Zpaq (level<<4 | block);
+        // 8 (CTYPE_ZPAQ) is the per-block stream ctype. Accept both.
+        2 | CTYPE_ZPAQ => (
             CompressionType::Zpaq,
             BackendProps::Zpaq {
                 level: prop >> 4,
