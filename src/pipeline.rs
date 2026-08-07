@@ -127,7 +127,6 @@ pub fn decompress(args: &Args) -> Result<()> {
         None
     };
 
-    let mut cursor = header_end;
     let pb = if let Some(size) = magic.expected_size {
         if !args.quiet {
             let pb = ProgressBar::new(size);
@@ -145,24 +144,14 @@ pub fn decompress(args: &Args) -> Result<()> {
         None
     };
 
+    // Pass 1 (serial, header parsing only): locate every chunk's RCD header
+    // and the offset of the next chunk. This is cheap compared to the actual
+    // decompression work.
+    let mut chunk_locs: Vec<(usize, crate::format::RcdHeader)> = Vec::new();
+    let mut cursor = header_end;
     while cursor < bytes.len() {
         let (rcd, consumed) = parse_rcd_header(bytes, cursor, encrypted, 2)?;
-        let rzip_chunk_data = decompress_chunk(&rcd, bytes, cursor, encrypted, args.encrypt.as_deref())?;
-        let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
-        let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
-        out_file.write_all(write_data)?;
 
-
-
-        
-        if let Some(ctx) = &mut md5_ctx {
-            ctx.consume(&rzip_chunk_data);
-        }
-
-        if let Some(ref pb) = pb {
-            pb.inc(rzip_chunk_data.len() as u64);
-        }
-        
         // Advance cursor to next RCD.
         let stream_header_start_rel = 2 + rcd.chunk_bytes as usize;
         let mut max_chunk_offset = consumed;
@@ -178,14 +167,52 @@ pub fn decompress(args: &Args) -> Result<()> {
                 }
             }
         }
-        
-        cursor += max_chunk_offset;
 
-        if rcd.is_last_chunk {
+        chunk_locs.push((cursor, rcd));
+        cursor += max_chunk_offset;
+        if chunk_locs.last().map(|(_, r)| r.is_last_chunk).unwrap_or(false) {
             break;
         }
     }
-    
+
+    // Pass 2 (parallel): decompress every chunk concurrently. Chunks are
+    // independent (they only read from the shared input mmap), so the zpaq
+    // decode stage scales across cores.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            args.threads
+                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)),
+        )
+        .build()
+        .context("failed to build decompression thread pool")?;
+
+    let chunk_results: Vec<Result<(usize, Vec<u8>)>> = pool.install(|| {
+        chunk_locs
+            .par_iter()
+            .enumerate()
+            .map(|(idx, (offset, rcd))| {
+                decompress_chunk(rcd, bytes, *offset, encrypted, args.encrypt.as_deref())
+                    .map(|data| (idx, data))
+            })
+            .collect()
+    });
+
+    // Pass 3 (serial): postprocess, write, hash, and progress in chunk order.
+    for result in chunk_results {
+        let (_, rzip_chunk_data) = result?;
+        let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
+        let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
+        out_file.write_all(write_data)?;
+
+        if let Some(ctx) = &mut md5_ctx {
+            ctx.consume(&rzip_chunk_data);
+        }
+
+        if let Some(ref pb) = pb {
+            pb.inc(rzip_chunk_data.len() as u64);
+        }
+    }
+
     if let Some(pb) = pb {
         pb.finish_with_message("Decompression complete");
     }
