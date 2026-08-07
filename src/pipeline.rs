@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use crc32fast::Hasher;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::cli::{Args, Backend};
 use crate::format::{
@@ -521,19 +522,41 @@ pub fn compress(args: &Args) -> Result<()> {
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     
     let mut md5_ctx = md5::Context::new();
+    // File-level MD5 is computed with a single serial pass over the input.
+    // MD5 is not incrementally parallelizable (non-Merkle hash), and one pass
+    // over the mmap is ~1s per GB — negligible vs the compression stage.
+    md5_ctx.consume(bytes);
 
-    for (idx, chunk) in chunk_map.chunks.iter().enumerate() {
-        pb.set_message(format!("Chunk {}/{}", idx + 1, chunk_map.chunks.len()));
-        let mut chunk_out = Vec::new();
-        let hasher = crate::rzip::RollingHash::new();
-        let mut table = crate::rzip::HashTable::new(rzip_config.level);
-        
-        let start = chunk.offset as usize;
-        let end = (chunk.offset + chunk.size) as usize;
-        md5_ctx.consume(&bytes[start..end]);
+    pb.set_message(format!("Compressing {} chunks with {} threads",
+        chunk_map.chunks.len(),
+        args.threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))));
 
-        compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &hasher, &mut table, &pb)?;
-        
+    // Thread pool honoring -t/--threads. Each chunk is independent: it owns
+    // its rolling hash, hash table, and backend compressor state, so chunks
+    // can be compressed concurrently. Output order is preserved by index.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            args.threads
+                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)),
+        )
+        .build()
+        .context("failed to build compression thread pool")?;
+
+    let chunk_results: Vec<Result<(usize, Vec<u8>)>> = pool.install(|| {
+        chunk_map
+            .chunks
+            .par_iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let mut chunk_out = Vec::new();
+                compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &pb)
+                    .map(|_| (idx, chunk_out))
+            })
+            .collect()
+    });
+
+    for result in chunk_results {
+        let (_, chunk_out) = result?;
         if !args.benchmark {
             out_file.write_all(&chunk_out)?;
         }
@@ -567,8 +590,6 @@ fn compress_chunk_to_buffer(
     config: &crate::rzip::RzipConfig,
     out: &mut Vec<u8>,
     args: &Args,
-    hasher: &crate::rzip::RollingHash,
-    table: &mut crate::rzip::HashTable,
     pb: &ProgressBar,
 ) -> Result<()> {
     use crate::rzip::{compress_chunk, RzipControl};
@@ -593,7 +614,11 @@ fn compress_chunk_to_buffer(
     let chunk_bytes = (bits / 8) as u8 + if bits % 8 != 0 { 1 } else { 0 };
 
     let mut current_lit_pos = 0;
-    let _stats = compress_chunk(chunk_data, config.level, hasher, table, |ctrl| {
+    // Per-chunk state: rolling hash + hash table are owned by this chunk so
+    // chunks can run concurrently without shared mutable state.
+    let hasher = crate::rzip::RollingHash::new();
+    let mut table = crate::rzip::HashTable::new(config.level);
+    let _stats = compress_chunk(chunk_data, config.level, &hasher, &mut table, |ctrl| {
         match ctrl {
             RzipControl::Literal { mut len } => {
                 while len > 0 {
