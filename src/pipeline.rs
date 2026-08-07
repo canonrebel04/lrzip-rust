@@ -134,7 +134,9 @@ pub fn decompress(args: &Args) -> Result<()> {
                 .template(PB_STYLE)
                 .unwrap()
                 .progress_chars(PB_CHARS));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
             Some(pb)
+
         } else {
             None
         }
@@ -513,13 +515,15 @@ pub fn compress(args: &Args) -> Result<()> {
     
     let pb = ProgressBar::new(total_size);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta}) {msg}")
         .unwrap()
         .progress_chars("#>-"));
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
     
     let mut md5_ctx = md5::Context::new();
 
-    for chunk in &chunk_map.chunks {
+    for (idx, chunk) in chunk_map.chunks.iter().enumerate() {
+        pb.set_message(format!("Chunk {}/{}", idx + 1, chunk_map.chunks.len()));
         let mut chunk_out = Vec::new();
         let hasher = crate::rzip::RollingHash::new();
         let mut table = crate::rzip::HashTable::new(rzip_config.level);
@@ -528,12 +532,11 @@ pub fn compress(args: &Args) -> Result<()> {
         let end = (chunk.offset + chunk.size) as usize;
         md5_ctx.consume(&bytes[start..end]);
 
-        compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &hasher, &mut table)?;
+        compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &hasher, &mut table, &pb)?;
         
         if !args.benchmark {
             out_file.write_all(&chunk_out)?;
         }
-        pb.inc(chunk.size);
     }
 
     pb.finish_with_message("Compression complete");
@@ -566,6 +569,7 @@ fn compress_chunk_to_buffer(
     args: &Args,
     hasher: &crate::rzip::RollingHash,
     table: &mut crate::rzip::HashTable,
+    pb: &ProgressBar,
 ) -> Result<()> {
     use crate::rzip::{compress_chunk, RzipControl};
     use crate::format::write_var_le;
@@ -600,6 +604,7 @@ fn compress_chunk_to_buffer(
                     literal_stream.extend_from_slice(&chunk_data[current_lit_pos..current_lit_pos + cur_len as usize]);
                     current_lit_pos += cur_len as usize;
                     len -= cur_len;
+                    pb.inc(cur_len as u64);
                 }
             }
             RzipControl::Match { mut len, mut offset } => {
@@ -613,9 +618,11 @@ fn compress_chunk_to_buffer(
                     current_lit_pos += cur_len as usize;
                     len -= cur_len;
                     offset += cur_len as u64;
+                    pb.inc(cur_len as u64);
                 }
             }
         }
+
 
     });
 
