@@ -5,6 +5,8 @@ pub mod rzip;
 pub mod ui;
 pub mod zpaq;
 pub mod encryption;
+pub mod preprocess;
+
 
 use anyhow::{Result, Context};
 use std::path::Path;

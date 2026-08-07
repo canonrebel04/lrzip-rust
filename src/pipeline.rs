@@ -145,7 +145,10 @@ pub fn decompress(args: &Args) -> Result<()> {
     while cursor < bytes.len() {
         let (rcd, consumed) = parse_rcd_header(bytes, cursor, encrypted, 2)?;
         let rzip_chunk_data = decompress_chunk(&rcd, bytes, cursor, encrypted, args.encrypt.as_deref())?;
-        out_file.write_all(&rzip_chunk_data)?;
+        let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
+        out_file.write_all(&postprocessed)?;
+
+
         
         if let Some(ctx) = &mut md5_ctx {
             ctx.consume(&rzip_chunk_data);
@@ -325,7 +328,11 @@ fn decompress_chunk(
                         lzo.decompress(compressed_data, block.uncompressed_len as usize)
                             .map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
                     }
+                    crate::format::CTYPE_BZIP3 => {
+                        compressed_data.to_vec()
+                    }
                     other => bail!("unsupported block ctype {}", other),
+
                 };
                 stream_buf.extend_from_slice(&decompressed);
             }
@@ -423,8 +430,11 @@ pub fn compress(args: &Args) -> Result<()> {
         InputData::Mmap(map)
     };
 
-    let bytes = input_data.as_slice();
+    let raw_bytes = input_data.as_slice();
+    let (preprocessed_buf, _kind) = crate::preprocess::preprocess(raw_bytes, args.dxt, args.deflate_pre);
+    let bytes = if preprocessed_buf.is_empty() { raw_bytes } else { preprocessed_buf.as_slice() };
     let total_size = bytes.len() as u64;
+
 
     let output_path = args.output.clone().unwrap_or_else(|| {
         let mut p = args.input.clone();
@@ -445,7 +455,7 @@ pub fn compress(args: &Args) -> Result<()> {
     // Prepare Magic Header
     let magic = MagicHeader {
         major: 0,
-        minor: 14,
+        minor: 15,
         expected_size: Some(total_size),
         encryption: if let Some(_password) = &args.encrypt {
              let mut salt = [0u8; 8];
@@ -465,7 +475,9 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::Zstd => CompressionType::Zstd { strategy: 0 },
             Backend::Zpaq => CompressionType::Zpaq,
             Backend::Bzip2 => CompressionType::Bzip2,
+            Backend::Bzip3 => CompressionType::Bzip3,
             Backend::Lzo => CompressionType::Lzo,
+            Backend::None => CompressionType::None,
         },
         backend_props: match args.get_backend() {
             Backend::Lzma => BackendProps::Lzma { dict_prop: 0x2d },
@@ -473,11 +485,14 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::Zstd => BackendProps::Zstd { level: 3 },
             Backend::Zpaq => BackendProps::Zpaq { level: args.level.unwrap_or(3), block_size: 0 },
             Backend::Bzip2 => BackendProps::Bzip2 { block_size_code: 9 }, // Default block 9
-            Backend::Lzo => BackendProps::None, // No specific props for LZO usually stored? Or None.
+            Backend::Bzip3 => BackendProps::Bzip3 { block_size_code: 14 },
+            Backend::Lzo => BackendProps::None,
+            Backend::None => BackendProps::None,
         },
         levels: CompressionLevels { rzip: 7, lrzip: 7 },
         comment_len: 0,
     };
+
 
     if !args.benchmark {
         out_file.write_all(&magic.write())?;
