@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/zpaq/libzpaq.cpp");
     println!("cargo:rerun-if-changed=src/zpaq/libzpaq.h");
     println!("cargo:rerun-if-env-changed=LRZIP_NOJIT");
+    println!("cargo:rerun-if-env-changed=LRZIP_JIT");
     println!("cargo:rerun-if-env-changed=LRZIP_NOOPENMP");
 
     let mut build = cc::Build::new();

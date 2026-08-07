@@ -1150,6 +1150,12 @@ public:
   }
 private:
 
+  // c8/hmap4 at offsets 0/4 — the ZPAQL JIT hardcodes these two loads
+  // (mov eax,[edi] / mov eax,[edi+4]) and has no displacement fixup pass,
+  // so they MUST sit at the top of the class as in upstream zpaq.
+  int c8;               // last 0...7 bits.
+  int hmap4;            // c8 split into nibbles
+
   // Vectorized Hot State aligned to 64-byte boundaries
   alignas(64) int p[256];           // predictions
   alignas(64) U32 h[256];           // unrolled copy of z.h
@@ -1159,8 +1165,6 @@ private:
   alignas(64) int dt2k[256];        // division table for match: dt2k[i] = 2^12/i
   alignas(64) int dt[1024];         // division table for cm: dt[i] = 2^16/(i+1.5)
 
-  int c8;               // last 0...7 bits.
-  int hmap4;            // c8 split into nibbles
   ZPAQL& z;             // VM to compute context hashes, includes H, n
   bool initTables;      // are tables initialized?
 

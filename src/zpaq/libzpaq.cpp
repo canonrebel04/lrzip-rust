@@ -3139,6 +3139,24 @@ void compress(Reader* in, Writer* out, const char* method,
 //////////////////////// ZPAQL::assemble() ////////////////////
 
 #ifndef NOJIT
+// TEMP DIAG: cache the LRZIP_JIT_* env flags once per process. The JIT hot
+// path must NOT call getenv() per byte: MSVC getenv walks the whole (large)
+// environment block uncached, which was ~100us/call with 140+ env vars and
+// made JIT compression ~100x slower than NOJIT.
+static bool jit_env_flag(const char* name) {
+  struct EnvFlag { const char* name; bool val; };
+  static EnvFlag flags[] = {
+    {"LRZIP_JIT_DUMP",    getenv("LRZIP_JIT_DUMP")    != 0},
+    {"LRZIP_JIT_TRACE",   getenv("LRZIP_JIT_TRACE")   != 0},
+    {"LRZIP_JIT_VERIFY",  getenv("LRZIP_JIT_VERIFY")  != 0},
+    {"LRZIP_JIT_UPDATE0", getenv("LRZIP_JIT_UPDATE0") != 0},
+    {"LRZIP_JIT_RUN0",    getenv("LRZIP_JIT_RUN0")    != 0},
+  };
+  for (size_t i = 0; i < sizeof(flags)/sizeof(flags[0]); ++i)
+    if (strcmp(name, flags[i].name) == 0) return flags[i].val;
+  return getenv(name) != 0;
+}
+
 /*
 assemble();
 
@@ -4024,20 +4042,30 @@ int Predictor::assemble_p() {
 
         if (S==8) put1(0x48);                  // rex.w
         put2a(0x8bb7, offc(ht));               // mov esi, [edi+&ht]
-        put2(0x8b07);                          // mov eax, edi ; c8
+        put2(0x8b07);                          // mov eax, [edi] ; c8 (c8 at offset 0 — see Predictor)
         put2(0x89c1);                          // mov ecx, eax ; c8
         put3(0x83f801);                        // cmp eax, 1
-        put2(0x740a);                          // je L1
+        put2(0x740e);                          // je L1 (+4: near jne is 4 bytes longer)
         put1a(0x25, 240);                      // and eax, 0xf0
         put3(0x83f810);                        // cmp eax, 16
-        put2(0x7576);                          // jne L2 ; skip find()
+        // jne near L2 (0f 85 rel32) — the mulhi hash pushed L2 past rel8
+        // range (135 bytes > 127), so this can't be a short jump anymore.
+        put2(0x0f85);                          // jne near
+        puta(135);                             // rel32 = 135 (validated vs pcode dump)
            // L1: ; find cxt in ht, return index in eax
         put3(0xc1e104);                        // shl ecx, 4
-        put2a(0x038f, off(h[i]));              // add [edi+&h[i]]
+        put2a(0x038f, off(h[i]));              // add ecx, [edi+&h[i]] ; cxt = h[i]+16*c8
         put2(0x89c8);                          // mov eax, ecx ; cxt
         put3(0xc1e902+cp[1]);                  // shr ecx, sizebits+2
-        put2a(0x81e1, 255);                    // and eax, 255 ; chk
-        put3(0xc1e004);                        // shl eax, 4
+        put2a(0x81e1, 255);                    // and ecx, 255 ; chk
+        // h0 = (mulhi64(cxt, 0xbf58476d1ce4e5b9) * 16) & (ht.size()-16)
+        // — must match the AVX2 fork's Swiss-table Predictor::find
+        // (multiply-high hash), not the upstream cxt*16 linear hash.
+        // imm64 is little-endian: bytes b9 e5 e4 1c 6d 47 58 bf
+        put1(0x48); put1(0xba); put4(0xb9e5e41c); put4(0x6d4758bf);  // mov rdx, K
+        put1(0x48); put1(0xf7); put1(0xe2);                          // mul rdx
+        put1(0x48); put3(0xc1e820);                                  // shr rax, 32
+        put3(0xc1e004);                                              // shl eax, 4
         put1a(0x25, (64<<cp[1])-16);           // and eax, ht.size()-16 = h0
         put3(0x3a0c06);                        // cmp cl, [esi+eax] ; ht[h0]
         put2(0x744d);                          // je L3 ; match h0
@@ -4174,7 +4202,7 @@ int Predictor::assemble_p() {
         // p[i]=(w*p[cp[2]]+(65536-w)*p[cp[3]])>>16;
         // assert(p[i]>=-2048 && p[i]<2048);
 
-        put2(0x8b07);                  // mov eax, [edi] ; c8
+        put2(0x8b07);                  // mov eax, [edi] ; c8 (c8 at offset 0 — see Predictor)
         put1a(0x25, cp[5]);            // and eax, mask
         put2a(0x0387, off(h[i]));      // add eax, [edi+&h[i]]
         put1a(0x25, (1<<cp[1])-1);     // and eax, size-1
@@ -4205,7 +4233,7 @@ int Predictor::assemble_p() {
         //   p[i]+=(wt[j]>>8)*p[cp[2]+j];
         // p[i]=clamp2k(p[i]>>8);
 
-        put2(0x8b07);                          // mov eax, [edi] ; c8
+        put2(0x8b07);                          // mov eax, [edi] ; c8 (c8 at offset 0 — see Predictor)
         put1a(0x25, cp[5]);                    // and eax, mask
         put2a(0x0387, off(h[i]));              // add eax, [edi+&h[i]]
         put1a(0x25, (1<<cp[1])-1);             // and eax, size-1
@@ -4355,6 +4383,7 @@ int Predictor::assemble_p() {
     assert(cp-hcomp<pr.z.cend);
     assert (cp[0]>=1 && cp[0]<=9);
     assert(compsize[cp[0]]>0 && compsize[cp[0]]<8);
+    int o0=o;
     switch (cp[0]) {
 
       case CONS:  // c
@@ -4407,7 +4436,7 @@ int Predictor::assemble_p() {
         // cr.ht[cr.c+(hmap4&15)]=st.next(cr.cxt, y);
 
         // update bit history bh to next(bh,y=ebp) in ht[c+(hmap4&15)]
-        put3(0x8b4700+off(hmap4));     // mov eax, [edi+&hmap4]
+        put3(0x8b4700+off(hmap4));     // mov eax, [edi+&hmap4] (hmap4 at offset 4 — see Predictor)
         put3(0x83e00f);                // and eax, 15
         put2a(0x0387, offc(c));        // add eax [edi+&c] ; cxt
         if (S==8) put1(0x48);          // rex.w
@@ -4653,22 +4682,72 @@ int Predictor::assemble_p() {
         if (S==8) put1(0x48);          // rex.w
         put3(0x8d3486);                // lea esi, [esi+eax*4] ; wt
 
+        // The AVX2 fork's MIX trains with a momentum velocity v[]:
+        //   delta = (err*p[j]+(1<<12))>>13;
+        //   v_old = v[cxt+j]; v_new = (v_old>>1)+delta; v[cxt+j]=v_new;
+        //   lookahead = v_new+((v_new-v_old)>>1);
+        //   wt[j] = clamp512k(wt[j]+lookahead);
+        // (upstream zpaq has no momentum — this is a fork divergence.
+        //  NOTE: the velocity is indexed by cxt, like the weights.)
+        if (S==8) {
+          // mov r8, [edi+&v]  (v data pointer)
+          put1(0x4c); put1(0x8b); put1(0x87); puta(offc(v));
+          // lea r8, [r8+rax*4] ; &v[cxt]  (eax still holds cxt)
+          // SIB = 10 000 000: scale*4, index=rax, base=r8 (REX.B=1).
+          // NOTE: 0x86 would decode base=rsi(->r14) and read v from garbage!
+          put1(0x4d); put1(0x8d); put1(0x04); put1(0x80);
+        }
+        else {
+          put2a(0x8b9f, offc(v));      // mov ebx, [edi+&v]
+          put3(0x8d1c83);              // lea ebx, [ebx+eax*4] ; &v[cxt]
+        }
+
         for (int k=0; k<cp[3]; ++k) {
           put2a(0x8b87,off(p[cp[2]+k]));//mov eax, [edi+&p[cp[2]+k]
-          put3(0x0fafc1);              // imul eax, ecx
+          put3(0x0fafc1);              // imul eax, ecx ; err*p[j]
           put1a(0x05, 1<<12);          // add eax, 1<<12
-          put3(0xc1f80d);              // sar eax, 13
-          put2(0x0306);                // add eax, [esi]
+          put3(0xc1f80d);              // sar eax, 13 ; delta
+          if (S==8) {
+            put1(0x41); put2(0x8b10);  // mov edx, [r8] ; v_old
+            put2(0x89d3);              // mov ebx, edx
+            put2(0xd1fb);              // sar ebx, 1
+            put2(0x01c3);              // add ebx, eax ; v_new
+            put1(0x41); put2(0x8918);  // mov [r8], ebx ; v[j]=v_new
+            put2(0x89d8);              // mov eax, ebx ; eax=v_new
+            put2(0x29d0);              // sub eax, edx ; v_new-v_old
+            put2(0xd1f8);              // sar eax, 1
+            put2(0x01d8);              // add eax, ebx ; lookahead
+          }
+          else {
+            // 32-bit: ebx = v ptr (set before the loop), ebp = v_old (ebp=y is dead after err is in ecx)
+            put2(0x8b2b);              // mov ebp, [ebx] ; v_old
+            put2(0x89ea);              // mov edx, ebp
+            put2(0xd1fa);              // sar edx, 1
+            put2(0x01c2);              // add edx, eax ; v_new
+            put2(0x89d0);              // mov eax, edx ; eax=v_new
+            put2(0x8913);              // mov [ebx], edx ; v[j]=v_new
+            put2(0x29ea);              // sub edx, ebp ; v_new-v_old
+            put2(0xd1fa);              // sar edx, 1
+            put2(0x01c2);              // add edx, eax ; lookahead
+            put2(0x89d0);              // mov eax, edx ; shared add eax,[esi] below adds wt
+          }
+          put2(0x0306);                // add eax, [esi] ; + wt[j]
           put1a(0x3d, (1<<19)-1);      // cmp eax, (1<<19)-1
-          put2(0x7e05);                // jge L1
+          put2(0x7e05);                // jle L1
           put1a(0xb8, (1<<19)-1);      // mov eax, (1<<19)-1
-          put1a(0x3d, 0xfff80000);     // cmp eax, -1<<19
-          put2(0x7d05);                // jle L2
+          put1a(0x3d, 0xfff80000);     // L1: cmp eax, -1<<19
+          put2(0x7d05);                // jge L2
           put1a(0xb8, 0xfff80000);     // mov eax, -1<<19
           put2(0x8906);                // L2: mov [esi], eax
           if (k<cp[3]-1) {
             if (S==8) put1(0x48);      // rex.w
             put3(0x83c604);            // add esi, 4
+            if (S==8) {
+              put1(0x49); put3(0x83c004);  // add r8, 4
+            }
+            else {
+              put3(0x83c304);          // add ebx, 4
+            }
           }
         }
         break;
@@ -4676,6 +4755,16 @@ int Predictor::assemble_p() {
       default:
         error("invalid ZPAQ component");
     }
+    if (jit_env_flag("LRZIP_JIT_DUMP")) {
+      fprintf(stderr, "[JIT] upd comp %d: type=%d at pcode offset %d..%d (%d bytes) cp=", i, cp[0], o0, o, o-o0);
+      for (int k = 0; k < compsize[cp[0]]; ++k) fprintf(stderr, " %d", cp[k]);
+      fprintf(stderr, "\n");
+    }
+  }
+  if (jit_env_flag("LRZIP_JIT_DUMP")) {
+    fprintf(stderr, "[JIT] upd code bytes 465..545: ");
+    for (int i = 465; i < 545 && i < o; ++i) fprintf(stderr, "%02x ", rcode[i]);
+    fprintf(stderr, "\n");
   }
 
   // return from update()
@@ -4685,10 +4774,87 @@ int Predictor::assemble_p() {
   put1(0x5b);                 // pop ebx
   put1(0xc3);                 // ret
 
+  // TEMP DIAG: dump the assembled pcode for off-line jump-target validation
+  if (jit_env_flag("LRZIP_JIT_DUMP")) {
+    FILE* f = fopen("pcode_predict.bin", "wb");
+    if (f) { fwrite(rcode, 1, o, f); fclose(f); }
+    fprintf(stderr, "[JIT-DUMP] wrote pcode_predict.bin (%d bytes)\n", o);
+  }
+
   return o;
 }
 
 #endif // ifndef NOJIT
+
+// ---- TEMPORARY JIT crash diagnostics (remove after fixing the SIGILL) ----
+#ifndef NOJIT
+#ifdef _MSC_VER
+#include <windows.h>
+static int jit_crash_diag(const char* what, const unsigned char* base, LPEXCEPTION_POINTERS ep) {
+  void* addr = ep->ExceptionRecord->ExceptionAddress;
+  fprintf(stderr, "[JIT-DIAG] %s crash at %p (code 0x%08lx)", what, addr,
+          (unsigned long)ep->ExceptionRecord->ExceptionCode);
+  if (base) fprintf(stderr, " (offset %td)", (char*)addr - (char*)base);
+  fprintf(stderr, "\n");
+  if (ep->ExceptionRecord->NumberParameters >= 2) {
+    fprintf(stderr, "[JIT-DIAG] fault on %s at %p\n",
+            ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
+            (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+  }
+  fprintf(stderr, "[JIT-DIAG] bytes before/at crash:\n");
+  const unsigned char* p = (const unsigned char*)addr;
+  for (int i = -32; i < 32; ++i) {
+    fprintf(stderr, "%02x ", i < 0 ? p[i] : p[i]);
+  }
+  fprintf(stderr, "\n[JIT-DIAG] bytes @-32..-1: ");
+  for (int i = -32; i < 0; ++i) fprintf(stderr, "%02x ", p[i]);
+  fprintf(stderr, "\n[JIT-DIAG] bytes @0..31: ");
+  for (int i = 0; i < 32; ++i) fprintf(stderr, "%02x ", p[i]);
+  fprintf(stderr, "[JIT-DIAG] regs: rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p rbp=%p rsp=%p r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+    (void*)ep->ContextRecord->Rax, (void*)ep->ContextRecord->Rbx,
+    (void*)ep->ContextRecord->Rcx, (void*)ep->ContextRecord->Rdx,
+    (void*)ep->ContextRecord->Rsi, (void*)ep->ContextRecord->Rdi,
+    (void*)ep->ContextRecord->Rbp, (void*)ep->ContextRecord->Rsp,
+    (void*)ep->ContextRecord->R8, (void*)ep->ContextRecord->R9,
+    (void*)ep->ContextRecord->R10, (void*)ep->ContextRecord->R11,
+    (void*)ep->ContextRecord->R12, (void*)ep->ContextRecord->R13,
+    (void*)ep->ContextRecord->R14, (void*)ep->ContextRecord->R15);
+  {
+    // dump 160 bytes of the JIT buffer around the crash (aligned down to 16)
+    const unsigned char* base = (const unsigned char*)((size_t)addr & ~(size_t)15);
+    fprintf(stderr, "[JIT-DIAG] buffer @%p (rel %td..%td):\n", base,
+            base - (const unsigned char*)base + 0, (size_t)0);
+    for (int row = 0; row < 10; ++row) {
+      fprintf(stderr, "[JIT-DIAG] %+06td: ", (const unsigned char*)base + row * 16 - (const unsigned char*)base);
+      for (int j = 0; j < 16; ++j)
+        fprintf(stderr, "%02x ", base[row * 16 + j]);
+      fprintf(stderr, "\n");
+    }
+    // dump the full pcode from its base (predict JIT) for disassembly
+    const unsigned char* pb = (const unsigned char*)base;
+    if (pb && ((size_t)addr - (size_t)pb) < 600) {
+      size_t rel = (size_t)addr - (size_t)pb;
+      size_t start = rel >= 200 ? rel - 200 : 0;
+      fprintf(stderr, "[JIT-DIAG] pcode dump (offset %td..%td):\n", start, start + 320);
+      for (size_t row = 0; row < 20; ++row) {
+        fprintf(stderr, "[JIT-DIAG] %05zd: ", start + row * 16);
+        for (int j = 0; j < 16; ++j)
+          fprintf(stderr, "%02x ", pb[start + row * 16 + j]);
+        fprintf(stderr, "\n");
+      }
+    }
+  }
+  // Print the crash, then let the exception continue (process dies as
+  // before, but now with the diagnostic on stderr).
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+#define JIT_TRY(label, base) __try
+#define JIT_CATCH(label, base) __except(jit_crash_diag((label), (base), GetExceptionInformation()))
+#else
+#define JIT_TRY(label, base)
+#define JIT_CATCH(label, base)
+#endif
+#endif
 
 // Return a prediction of the next bit in range 0..32767
 // Use JIT code starting at pcode[0] if available, or else create it.
@@ -4707,7 +4873,79 @@ int Predictor::predict() {
       error("run JIT failed");
   }
   assert(pcode && pcode[0]);
-  return ((int(*)(Predictor*))&pcode[10])(this);
+  if (jit_env_flag("LRZIP_JIT_TRACE")) fprintf(stderr, "[TRACE] predict JIT call\n");
+  int r;
+  JIT_TRY("predict", pcode) {
+    r=((int(*)(Predictor*))&pcode[10])(this);
+  } JIT_CATCH("predict", pcode) {
+    error("JIT predict crashed");
+  }
+  // TEMP DIAG: compare JIT predict vs interpreter predict (return + state)
+  if (jit_env_flag("LRZIP_JIT_VERIFY")) {
+    // snapshot state before either path (ht is a heap Array — copy contents)
+    U32 p_snap[256], h_snap[256];
+    int cxt_snap[256];
+    size_t a_snap[256], b_snap[256], c_snap[256];
+    U8 ht_snap[256][16];
+    size_t ht_size_snap[256];
+    memcpy(p_snap, p, sizeof p);
+    memcpy(h_snap, h, sizeof h);
+    for (int i = 0; i < 256; ++i) {
+      cxt_snap[i] = int(comp[i].cxt);
+      a_snap[i] = comp[i].a; b_snap[i] = comp[i].b; c_snap[i] = comp[i].c;
+      ht_size_snap[i] = comp[i].ht.size();
+      for (size_t j = 0; j < comp[i].ht.size() && j < 16; ++j)
+        ht_snap[i][j] = comp[i].ht[j];
+    }
+    auto restore = [&]() {
+      memcpy(p, p_snap, sizeof p);
+      memcpy(h, h_snap, sizeof h);
+      for (int i = 0; i < 256; ++i) {
+        comp[i].cxt = cxt_snap[i];
+        comp[i].a = a_snap[i]; comp[i].b = b_snap[i]; comp[i].c = c_snap[i];
+        for (size_t j = 0; j < comp[i].ht.size() && j < 16; ++j)
+          comp[i].ht[j] = ht_snap[i][j];
+      }
+    };
+    // JIT path from the pristine snapshot
+    restore();
+    int rj = ((int(*)(Predictor*))&pcode[10])(this);
+    U32 p_jit[256], h_jit[256];
+    int cxt_jit[256];
+    size_t a_jit[256], b_jit[256], c_jit[256];
+    U8 ht_jit[256][16];
+    memcpy(p_jit, p, sizeof p);
+    memcpy(h_jit, h, sizeof h);
+    for (int i = 0; i < 256; ++i) {
+      cxt_jit[i] = int(comp[i].cxt);
+      a_jit[i] = comp[i].a; b_jit[i] = comp[i].b; c_jit[i] = comp[i].c;
+      for (size_t j = 0; j < comp[i].ht.size() && j < 16; ++j)
+        ht_jit[i][j] = comp[i].ht[j];
+    }
+    // interpreter path from the same pristine snapshot
+    restore();
+    int r0 = predict0();
+    // compare
+    static int n = 0;
+    if (n < 4096) {
+      int diffs = 0;
+      int first_comp = -1;
+      const char* kind = "";
+      for (int i = 0; i < 256; ++i) {
+        if (p_jit[i] != p[i]) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "p"; } }
+        if (h_jit[i] != h[i]) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "h"; } }
+        if (cxt_jit[i] != int(comp[i].cxt)) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "cxt"; } }
+        if (a_jit[i] != comp[i].a) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "a"; } }
+        if (b_jit[i] != comp[i].b) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "b"; } }
+        if (c_jit[i] != comp[i].c) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "c"; } }
+        if (memcmp(ht_jit[i], ht_snap[i], 16) && comp[i].ht.size() >= 16) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "ht"; } }
+      }
+      fprintf(stderr, "[JIT-VERIFY] predict: r_jit=%d r_int=%d state_diffs=%d first=(%s comp%d)%s\n",
+              rj, r0, diffs, kind, first_comp, diffs ? "  *** PREDICT DIVERGENCE ***" : "");
+      ++n;
+    }
+  }
+  return r;
 #endif
 }
 
@@ -4717,8 +4955,149 @@ void Predictor::update(int y) {
 #ifdef NOJIT
   update0(y);
 #else
+  // TEMP DIAG: compare JIT update vs interpreter update (full state)
+  if (jit_env_flag("LRZIP_JIT_VERIFY")) {
+    static int udone = 0;
+    if (udone < 4096) {
+      // --- snapshot the whole machine state ---
+      // Predictor fields
+      U32 p_snap[256], h_snap[256];
+      size_t cxt_snap[256], a_snap[256], b_snap[256], c_snap[256];
+      int c8_snap = c8, hm_snap = hmap4;
+      memcpy(p_snap, p, sizeof p);
+      memcpy(h_snap, h, sizeof h);
+      struct Buf { void* ptr; size_t n; };
+      Buf hts[256], cms[256], a16s[256], vs_[256];
+      U8* ht_copy[256]; U8* cm_copy[256]; U8* a16_copy[256]; U8* v_copy[256];
+      for (int i = 0; i < 256; ++i) {
+        cxt_snap[i] = comp[i].cxt; a_snap[i] = comp[i].a; b_snap[i] = comp[i].b; c_snap[i] = comp[i].c;
+        hts[i].n = comp[i].ht.size(); ht_copy[i] = new U8[hts[i].n ? hts[i].n : 1];
+        memcpy(ht_copy[i], comp[i].ht.get_aligned_data(), hts[i].n);
+        cms[i].n = comp[i].cm.size() * sizeof(U32); cm_copy[i] = new U8[cms[i].n ? cms[i].n : 1];
+        memcpy(cm_copy[i], comp[i].cm.get_aligned_data(), cms[i].n);
+        a16s[i].n = comp[i].a16.size() * sizeof(U16); a16_copy[i] = new U8[a16s[i].n ? a16s[i].n : 1];
+        memcpy(a16_copy[i], comp[i].a16.get_aligned_data(), a16s[i].n);
+        vs_[i].n = comp[i].v.size() * sizeof(int); v_copy[i] = new U8[vs_[i].n ? vs_[i].n : 1];
+        memcpy(v_copy[i], comp[i].v.get_aligned_data(), vs_[i].n);
+      }
+      auto restore = [&]() {
+        c8 = c8_snap; hmap4 = hm_snap;
+        memcpy(p, p_snap, sizeof p);
+        memcpy(h, h_snap, sizeof h);
+        for (int i = 0; i < 256; ++i) {
+          comp[i].cxt = cxt_snap[i]; comp[i].a = a_snap[i]; comp[i].b = b_snap[i]; comp[i].c = c_snap[i];
+          memcpy(comp[i].ht.get_aligned_data(), ht_copy[i], hts[i].n);
+          memcpy(comp[i].cm.get_aligned_data(), cm_copy[i], cms[i].n);
+          memcpy(comp[i].a16.get_aligned_data(), a16_copy[i], a16s[i].n);
+          memcpy(comp[i].v.get_aligned_data(), v_copy[i], vs_[i].n);
+        }
+      };
+      // JIT update from the snapshot
+      restore();
+      if (jit_env_flag("LRZIP_JIT_VERIFY")) fprintf(stderr, "[JIT-VERIFY] u%d step: snapshot+restore done, calling JIT update (cxt[7]=%zu vsize[7]=%zu vdata=%p voff=%td mem@voff=%llu cmdata=%p cmoff=%td cxtoff=%td)\n", udone, comp[7].cxt, comp[7].v.size(), comp[7].v.get_aligned_data(), (char*)&comp[7].v - (char*)this, (unsigned long long)*(size_t*)((char*)this + ((char*)&comp[7].v - (char*)this)), comp[7].cm.get_aligned_data(), (char*)&comp[7].cm - (char*)this, (char*)&comp[7].cxt - (char*)this);
+      int c8_before = c8, hm_before = hmap4;
+      JIT_TRY("update-verify", pcode) {
+        ((void(*)(Predictor*, int))&pcode[5])(this, y);
+      } JIT_CATCH("update-verify", pcode) {
+        fprintf(stderr, "[JIT-VERIFY] update JIT call CRASHED at y=%d\n", y);
+        throw std::runtime_error("verify update crash");
+      }
+      if (jit_env_flag("LRZIP_JIT_VERIFY")) fprintf(stderr, "[JIT-VERIFY] u%d step: JIT update returned\n", udone);
+      int c8_after_jit = c8, hm_after_jit = hmap4;   // right after JIT code, BEFORE wrapper
+      U32 p_jit[256], h_jit[256];
+      size_t cxt_jit[256], a_jit[256], b_jit[256], c_jit[256];
+      int c8_jit = c8, hm_jit = hmap4;
+      U8* ht_post_jit[256]; U8* cm_post_jit[256]; U8* v_post_jit[256];
+      memcpy(p_jit, p, sizeof p);
+      memcpy(h_jit, h, sizeof h);
+      for (int i = 0; i < 256; ++i) {
+        if (jit_env_flag("LRZIP_JIT_VERIFY") && i % 64 == 0) fprintf(stderr, "[JIT-VERIFY] u%d step: post-copy i=%d\n", udone, i);
+        cxt_jit[i] = comp[i].cxt; a_jit[i] = comp[i].a; b_jit[i] = comp[i].b; c_jit[i] = comp[i].c;
+        ht_post_jit[i] = new U8[hts[i].n ? hts[i].n : 1];
+        memcpy(ht_post_jit[i], comp[i].ht.get_aligned_data(), hts[i].n);
+        cm_post_jit[i] = new U8[cms[i].n ? cms[i].n : 1];
+        memcpy(cm_post_jit[i], comp[i].cm.get_aligned_data(), cms[i].n);
+        v_post_jit[i] = new U8[vs_[i].n ? vs_[i].n : 1];
+        memcpy(v_post_jit[i], comp[i].v.get_aligned_data(), vs_[i].n);
+      }
+      // interpreter update from the same snapshot
+      restore();
+      update0(y);
+      // compare (JIT post-state vs interpreter post-state)
+      int diffs = 0;
+      int first_comp = -1;
+      const char* kind = "";
+      for (int i = 0; i < 256; ++i) {
+        if (p_jit[i] != p[i]) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "p"; } }
+        if (h_jit[i] != h[i]) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "h"; } }
+        if (cxt_jit[i] != comp[i].cxt) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "cxt"; } }
+        if (a_jit[i] != comp[i].a) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "a"; } }
+        if (b_jit[i] != comp[i].b) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "b"; } }
+        if (c_jit[i] != comp[i].c) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "c"; } }
+        if (memcmp(ht_post_jit[i], comp[i].ht.get_aligned_data(), hts[i].n)) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "ht"; } }
+        if (memcmp(cm_post_jit[i], comp[i].cm.get_aligned_data(), cms[i].n)) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "cm"; } }
+        if (memcmp(v_post_jit[i], comp[i].v.get_aligned_data(), vs_[i].n)) { ++diffs; if (first_comp < 0) { first_comp = i; kind = "v"; } }
+      }
+      if (c8_jit != c8) ++diffs;
+      if (hm_jit != hmap4) ++diffs;
+      if (diffs > 2 || first_comp >= 0) {
+        // REAL divergence beyond the known c8/hmap4 pre-wrapper artifact
+        fprintf(stderr, "[JIT-VERIFY] update: y=%d diffs=%d first=(%s comp%d)  *** FIRST REAL UPDATE DIVERGENCE at byte %d ***\n", y, diffs, kind, first_comp, udone);
+        fprintf(stderr, "  c8: jit=%d int=%d | hmap4: jit=%d int=%d | c8 before=%d after_jit=%d (hmap4 after_jit=%d)\n",
+                c8_jit, c8, hm_jit, hmap4, c8_before, c8_after_jit, hm_after_jit);
+        if (first_comp >= 0) {
+          int fc = first_comp;
+          fprintf(stderr, "  comp%d cxt: jit=%zu int=%zu\n", fc, cxt_jit[fc], comp[fc].cxt);
+          size_t diffat = SIZE_MAX;
+          for (size_t j = 0; j < cms[fc].n; ++j)
+            if (cm_post_jit[fc][j] != ((U8*)comp[fc].cm.get_aligned_data())[j]) { diffat = j; break; }
+          if (diffat != SIZE_MAX) {
+            size_t s = diffat >= 16 ? diffat - 16 : 0;
+            fprintf(stderr, "  comp%d cm diff@%zu:\n", fc, diffat);
+            fprintf(stderr, "    jit:");
+            for (size_t j = s; j < s + 32 && j < cms[fc].n; ++j) fprintf(stderr, " %02x", cm_post_jit[fc][j]);
+            fprintf(stderr, "\n    int:");
+            for (size_t j = s; j < s + 32 && j < cms[fc].n; ++j) fprintf(stderr, " %02x", ((U8*)comp[fc].cm.get_aligned_data())[j]);
+            fprintf(stderr, "\n");
+          }
+          size_t vdiffat = SIZE_MAX;
+          for (size_t j = 0; j < vs_[fc].n; ++j)
+            if (v_post_jit[fc][j] != ((U8*)comp[fc].v.get_aligned_data())[j]) { vdiffat = j; break; }
+          if (vdiffat != SIZE_MAX) {
+            size_t s = vdiffat >= 16 ? vdiffat - 16 : 0;
+            fprintf(stderr, "  comp%d v diff@%zu:\n", fc, vdiffat);
+            fprintf(stderr, "    jit:");
+            for (size_t j = s; j < s + 32 && j < vs_[fc].n; ++j) fprintf(stderr, " %02x", v_post_jit[fc][j]);
+            fprintf(stderr, "\n    int:");
+            for (size_t j = s; j < s + 32 && j < vs_[fc].n; ++j) fprintf(stderr, " %02x", ((U8*)comp[fc].v.get_aligned_data())[j]);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  comp%d v_old(jit used):", fc);
+            for (size_t j = 0; j < vs_[fc].n && j < 8; ++j) fprintf(stderr, " %d", ((int*)v_copy[fc])[j]);
+            fprintf(stderr, "\n  comp%d p[0..6]:", fc);
+            for (int j = 0; j < 7; ++j) fprintf(stderr, " %d", p[j]);
+            fprintf(stderr, " | p[7]=%d squash(p[7])=%d squasht[0]=%d squasht[2048]=%d\n", p[7], squasht[p[7]+2048], squasht[0], squasht[2048]);
+          }
+        }
+      }
+      for (int i = 0; i < 256; ++i) {
+        delete[] ht_copy[i]; delete[] cm_copy[i]; delete[] a16_copy[i]; delete[] v_copy[i];
+        delete[] ht_post_jit[i]; delete[] cm_post_jit[i]; delete[] v_post_jit[i];
+      }
+      ++udone;
+    }
+  }
+  // TEMP DIAG: force the interpreter update path to bisect the divergence
+  if (jit_env_flag("LRZIP_JIT_UPDATE0")) {
+    update0(y);
+    return;
+  }
   assert(pcode && pcode[5]);
-  ((void(*)(Predictor*, int))&pcode[5])(this, y);
+  if (jit_env_flag("LRZIP_JIT_TRACE")) fprintf(stderr, "[TRACE] update JIT call y=%d\n", y);
+  JIT_TRY("update", pcode) {
+    ((void(*)(Predictor*, int))&pcode[5])(this, y);
+  } JIT_CATCH("update", pcode) {
+    error("JIT update crashed");
+  }
 
   // Save bit y in c8, hmap4 (not implemented in JIT)
   c8+=c8+y;
@@ -4741,6 +5120,11 @@ void ZPAQL::run(U32 input) {
 #ifdef NOJIT
   run0(input);
 #else
+  // TEMP DIAG: force the interpreter run path to bisect the divergence
+  if (jit_env_flag("LRZIP_JIT_RUN0")) {
+    run0(input);
+    return;
+  }
   if (!rcode) {
     allocx(rcode, rcode_size, (hend*10+4096)&-4096);
     int n=assemble();
@@ -4752,7 +5136,12 @@ void ZPAQL::run(U32 input) {
       error("run JIT failed");
   }
   a=input;
-  const U32 rc=((int(*)())(&rcode[0]))();
+  U32 rc;
+  JIT_TRY("run", rcode) {
+    rc=((int(*)())(&rcode[0]))();
+  } JIT_CATCH("run", rcode) {
+    error("JIT run crashed");
+  }
   if (rc==0) return;
   else if (rc==1) libzpaq::error("Bad ZPAQL opcode");
   else if (rc==2) libzpaq::error("Out of memory");
