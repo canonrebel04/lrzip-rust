@@ -71,7 +71,7 @@ pub fn execute(args: &Args) -> Result<()> {
     let (rcd, _consumed) = parse_rcd_header(bytes, header_end, encrypted, 2)?;
 
     if args.info {
-        print_info(&magic, &rcd);
+        print_info(&magic, &rcd, bytes);
         return Ok(());
     }
 
@@ -368,9 +368,7 @@ fn decompress_chunk(
                         out
                     }
                     crate::format::CTYPE_LZO => {
-                        let mut lzo = minilzo_rs::LZO::init().map_err(|e| anyhow::anyhow!("lzo init error: {:?}", e))?;
-                        lzo.decompress(compressed_data, block.uncompressed_len as usize)
-                            .map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
+                        lzo_decompress_safe(compressed_data, block.uncompressed_len as usize)?
                     }
                     crate::format::CTYPE_BZIP3 => {
                         compressed_data.to_vec()
@@ -514,6 +512,79 @@ fn effective_level(literal: &[u8], requested: u8, auto: bool) -> u8 {
     }
 }
 
+/// LZO1X compress via the vendored LZO 2.10 (src/zpaq/lzo). Level >= 9 uses
+/// lzo1x_999 (strongest, C++ lrzip parity); otherwise lzo1x_1 (fast, same
+/// as the old minilzo backend).
+fn lzo_compress_level(data: &[u8], level: u8) -> anyhow::Result<Vec<u8>> {
+    use crate::zpaq::lzo::*;
+    use std::sync::Once;
+    static LZO_INIT: Once = Once::new();
+    LZO_INIT.call_once(|| unsafe {
+        lzo_init();
+    });
+
+    // LZO worst-case output: src + src/16 + 64 + 3
+    let worst = data.len() + data.len() / 16 + 64 + 3;
+    let mut dst = vec![0u8; worst];
+    let mut dst_len: usize = 0;
+    let rc = if level >= 9 {
+        // u64 buffer keeps the work memory LZO_ALIGN-aligned
+        let mut wrk = vec![0u64; LZO1X_999_MEM_COMPRESS / 8];
+        unsafe {
+            lzo1x_999_compress(
+                data.as_ptr(),
+                data.len(),
+                dst.as_mut_ptr(),
+                &mut dst_len,
+                wrk.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        }
+    } else {
+        let mut wrk = vec![0u64; LZO1X_1_MEM_COMPRESS / 8];
+        unsafe {
+            lzo1x_1_compress(
+                data.as_ptr(),
+                data.len(),
+                dst.as_mut_ptr(),
+                &mut dst_len,
+                wrk.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        }
+    };
+    if rc != LZO_E_OK {
+        anyhow::bail!("lzo1x compress failed: rc={}", rc);
+    }
+    dst.truncate(dst_len);
+    Ok(dst)
+}
+
+/// LZO1X decompress via the vendored LZO 2.10 (safe variant, bounds-checked).
+fn lzo_decompress_safe(data: &[u8], expected: usize) -> anyhow::Result<Vec<u8>> {
+    use crate::zpaq::lzo::*;
+    use std::sync::Once;
+    static LZO_INIT: Once = Once::new();
+    LZO_INIT.call_once(|| unsafe {
+        lzo_init();
+    });
+
+    let mut dst = vec![0u8; expected];
+    let mut dst_len: usize = expected;
+    let rc = unsafe {
+        lzo1x_decompress_safe(
+            data.as_ptr(),
+            data.len(),
+            dst.as_mut_ptr(),
+            &mut dst_len,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != LZO_E_OK {
+        anyhow::bail!("lzo1x decompress failed: rc={}", rc);
+    }
+    dst.truncate(dst_len);
+    Ok(dst)
+}
+
 pub fn compress(args: &Args) -> Result<()> {
     let start_time = Instant::now();
     let input_data = if args.disable_mmap {
@@ -597,7 +668,13 @@ pub fn compress(args: &Args) -> Result<()> {
                         .map(|l| l as u8)
                         .unwrap_or(3)
                 }),
-                block_size: 0,
+                // Block size code = log2(MiB), capped at 15 (byte 18's low
+                // nibble). 0 = default (one block per input chunk).
+                block_size: if args.zpaqbs > 0 {
+                    (31 - args.zpaqbs.leading_zeros()).min(15) as u8
+                } else {
+                    0
+                },
             },
             Backend::Bzip2 => BackendProps::Bzip2 { block_size_code: 9 }, // Default block 9
             Backend::Bzip3 => BackendProps::Bzip3 { block_size_code: 14 },
@@ -605,12 +682,15 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::None => BackendProps::None,
         },
         levels: CompressionLevels { rzip: 7, lrzip: 7 },
-        comment_len: 0,
+        comment_len: args.comment.as_ref().map(|c| c.len().min(255) as u8).unwrap_or(0),
     };
 
 
     if !args.benchmark {
         out_file.write_all(&magic.write())?;
+        if let Some(comment) = &args.comment {
+            out_file.write_all(&comment.as_bytes()[..comment.len().min(255)])?;
+        }
     }
 
     // rzip configuration
@@ -846,8 +926,7 @@ fn compress_chunk_to_buffer(
         }
         Backend::Bzip3 => control_stream.clone(),
         Backend::Lzo => {
-            let mut lzo = minilzo_rs::LZO::init().map_err(|e| anyhow::anyhow!("lzo init error: {:?}", e))?;
-            lzo.compress(&control_stream).map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
+            lzo_compress_level(&control_stream, args.level.unwrap_or(3))?
         }
         Backend::None => control_stream.clone(),
     };
@@ -884,6 +963,8 @@ fn compress_chunk_to_buffer(
             let eff = effective_level(&literal_stream, requested, args.auto_level);
             if let Some(method) = &args.method {
                 crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())
+            } else if args.zpaqbs > 0 {
+                crate::zpaq::compress_block(&literal_stream, eff, args.zpaqbs, None, std::ptr::null_mut())
             } else {
                 crate::zpaq::compress(&literal_stream, eff, None, std::ptr::null_mut())
             }
@@ -895,8 +976,7 @@ fn compress_chunk_to_buffer(
         }
         Backend::Bzip3 => literal_stream.clone(),
         Backend::Lzo => {
-            let mut lzo = minilzo_rs::LZO::init().map_err(|e| anyhow::anyhow!("lzo init error: {:?}", e))?;
-            lzo.compress(&literal_stream).map_err(|e| anyhow::anyhow!("lzo error: {:?}", e))?
+            lzo_compress_level(&literal_stream, args.level.unwrap_or(3))?
         }
         Backend::None => literal_stream.clone(),
     };
@@ -988,7 +1068,7 @@ fn compress_chunk_to_buffer(
     Ok(())
 }
 
-fn print_info(magic: &MagicHeader, rcd: &crate::format::RcdHeader) {
+fn print_info(magic: &MagicHeader, rcd: &crate::format::RcdHeader, raw: &[u8]) {
     println!("LRZIP-NEXT {}.{}", magic.major, magic.minor);
     match magic.expected_size {
         Some(size) => println!("Expected size: {}", size),
@@ -1008,6 +1088,14 @@ fn print_info(magic: &MagicHeader, rcd: &crate::format::RcdHeader) {
         magic.levels.rzip, magic.levels.lrzip
     );
     println!("Comment length: {}", magic.comment_len);
+    if magic.comment_len > 0 {
+        let start = MAGIC_LEN_V11;
+        let end = start + magic.comment_len as usize;
+        if end <= raw.len() {
+            let comment = String::from_utf8_lossy(&raw[start..end]);
+            println!("Comment: {}", comment);
+        }
+    }
     println!(
         "Chunk bytes: {} (last chunk: {})",
         rcd.chunk_bytes, rcd.is_last_chunk
@@ -1076,7 +1164,11 @@ fn format_backend_props(props: BackendProps) -> String {
         BackendProps::None => "none".to_string(),
         BackendProps::Lzma { dict_prop } => format!("lzma(dict_prop={})", dict_prop),
         BackendProps::Zpaq { level, block_size } => {
-            format!("zpaq(level={}, block={})", level, block_size)
+            if block_size > 0 {
+                format!("zpaq(level={}, block={}M)", level, 1u64 << block_size)
+            } else {
+                format!("zpaq(level={}, block=auto)", level)
+            }
         }
         BackendProps::Bzip3 { block_size_code } => {
             format!("bzip3(block={})", block_size_code)

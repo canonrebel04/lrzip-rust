@@ -1,5 +1,7 @@
 use libc::{c_int, c_long, c_uchar};
 
+pub mod lzo;
+
 pub type ProgressCallback = extern "C" fn(pct: c_int, thread: c_long, userdata: *mut std::ffi::c_void);
 
 unsafe extern "C" {
@@ -20,6 +22,18 @@ unsafe extern "C" {
         s_buf: *const c_uchar,
         s_len: i64,
         method: *const std::ffi::c_char,
+        callback: Option<ProgressCallback>,
+        userdata: *mut std::ffi::c_void,
+        thread: c_long,
+    );
+
+    pub fn zpaq_compress_block(
+        c_buf: *mut c_uchar,
+        c_len: *mut i64,
+        s_buf: *const c_uchar,
+        s_len: i64,
+        level: c_int,
+        block_mb: c_int,
         callback: Option<ProgressCallback>,
         userdata: *mut std::ffi::c_void,
         thread: c_long,
@@ -82,6 +96,37 @@ pub fn compress_method(
             input.as_ptr(),
             input.len() as i64,
             method_c.as_ptr(),
+            callback,
+            userdata,
+            0,
+        );
+    }
+
+    out.truncate(out_len as usize);
+    out
+}
+
+/// Compress at a level digit, splitting the input into blocks of `block_mb`
+/// MiB (C++ lrzip's -zpaqbs). Each block is an independent zpaq segment, so
+/// the model sizes scale with the block size; decompression is unchanged.
+pub fn compress_block(
+    input: &[u8],
+    level: u8,
+    block_mb: u32,
+    callback: Option<ProgressCallback>,
+    userdata: *mut std::ffi::c_void,
+) -> Vec<u8> {
+    let mut out = vec![0u8; input.len() * 2 + 1024];
+    let mut out_len: i64 = 0;
+
+    unsafe {
+        zpaq_compress_block(
+            out.as_mut_ptr(),
+            &mut out_len,
+            input.as_ptr(),
+            input.len() as i64,
+            level as c_int,
+            block_mb as c_int,
             callback,
             userdata,
             0,

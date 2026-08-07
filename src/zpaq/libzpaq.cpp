@@ -7885,6 +7885,48 @@ void zpaq_compress_method(
     *c_len = out_len;
 }
 
+// Block-size variant (C++ lrzip's -zpaqbs): compresses the input in blocks
+// of block_mb MiB, each block becoming its own zpaq segment. The digit
+// method's model sizes (LZ77 hash table / suffix array) derive from each
+// block's size, so 2-16MB blocks give small, fast models and 128MB+ give
+// larger, stronger ones. The zpaq decompressor reads blocks until the
+// stream is exhausted, so multi-block output stays self-describing.
+void zpaq_compress_block(
+    unsigned char *c_buf,
+    int64_t *c_len,
+    const unsigned char *s_buf,
+    int64_t s_len,
+    int level,
+    int block_mb,
+    void (*callback)(int, int64_t, void*),
+    void *userdata,
+    int64_t thread
+) {
+    char method[16];
+    snprintf(method, sizeof(method), "%d", level);
+
+    const int64_t block_bytes = int64_t(block_mb) << 20;
+    if (block_bytes <= 0) {
+        *c_len = 0;
+        return;
+    }
+
+    libzpaq::StringBuffer out;
+    const int64_t nblocks = (s_len + block_bytes - 1) / block_bytes;
+    for (int64_t b = 0; b < nblocks; ++b) {
+        const int64_t off = b * block_bytes;
+        const int64_t n = (s_len - off < block_bytes) ? (s_len - off) : block_bytes;
+        libzpaq::StringBuffer block;
+        block.write((const char*)s_buf + off, n);
+        libzpaq::compress(&block, &out, method);
+        if (callback) callback((int)((b + 1) * 100 / nblocks), thread, userdata);
+    }
+
+    int64_t out_len = out.size();
+    memcpy(c_buf, out.data(), out_len);
+    *c_len = out_len;
+}
+
 void zpaq_decompress(
     unsigned char *s_buf,
     int64_t *d_len,

@@ -47,5 +47,30 @@ fn main() {
     if openmp && !target.contains("windows-msvc") {
         println!("cargo:rustc-link-lib=gomp");
     }
+
+    // Vendored LZO 2.10 (lzo1x subset: 1x1 + 1x999 compress, safe
+    // decompress) — replaces lzo-sys/minilzo-rs so no cmake is needed.
+    // LZO is GPL-2+ with the static-linking exception (same surface as the
+    // lzo-sys crate; lrzip is GPL-3).
+    println!("cargo:rerun-if-changed=src/zpaq/lzo/src");
+    println!("cargo:rerun-if-changed=src/zpaq/lzo/include");
+    let mut lzo = cc::Build::new();
+    lzo.cpp(false)
+        .files([
+            "src/zpaq/lzo/src/lzo_init.c",
+            "src/zpaq/lzo/src/lzo_crc.c",
+            "src/zpaq/lzo/src/lzo_ptr.c",
+            "src/zpaq/lzo/src/lzo_str.c",
+            "src/zpaq/lzo/src/lzo_util.c",
+            "src/zpaq/lzo/src/lzo1x_1.c",
+            "src/zpaq/lzo/src/lzo1x_9x.c",
+            "src/zpaq/lzo/src/lzo1x_d2.c",
+        ])
+        .include("src/zpaq/lzo/src")
+        .include("src/zpaq/lzo/include")
+        .warnings(false)
+        .extra_warnings(false)
+        .flag_if_supported("-O2");
+    lzo.compile("lzo_vendored");
 }
 

@@ -118,6 +118,17 @@ pub struct Args {
     #[arg(long = "auto-level")]
     pub auto_level: bool,
 
+    /// ZPAQ block size in MiB (C++ lrzip's -zpaqbs, 2-2048): the literal
+    /// stream is compressed as independent blocks of this size, so model
+    /// sizes scale with it. Smaller = faster/less memory, larger = stronger.
+    /// Default: one block per input chunk.
+    #[arg(long = "zpaqbs", value_name = "MIB", default_value_t = 0)]
+    pub zpaqbs: u32,
+
+    /// Store a comment in the archive header (shown by --info).
+    #[arg(short = 'C', long = "comment", value_name = "TEXT")]
+    pub comment: Option<String>,
+
     /// Reversible pre-filter applied before the rzip stage.
     #[arg(long = "filter", value_enum, default_value_t = Filter::None)]
     pub filter: Filter,
