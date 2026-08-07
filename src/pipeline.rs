@@ -461,6 +461,59 @@ fn decompress_chunk(
 
 
 
+/// Sample Shannon entropy (bits/byte) of a buffer, capped at 4M sampled
+/// bytes via stride. Used by --auto-level to pick a cheaper zpaq level for
+/// incompressible literal streams (L1 ≈ same ratio as L3 there, ~6x faster).
+fn estimate_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 8.0;
+    }
+    let step = (data.len() / 4_000_000).max(1);
+    let mut counts = [0u64; 256];
+    let mut total = 0u64;
+    let mut i = 0;
+    while i < data.len() && total < 4_000_000 {
+        counts[data[i] as usize] += 1;
+        total += 1;
+        i += step;
+    }
+    if total == 0 {
+        return 8.0;
+    }
+    let mut ent = 0.0f64;
+    for &c in counts.iter() {
+        if c > 0 {
+            let p = c as f64 / total as f64;
+            ent -= p * p.log2();
+        }
+    }
+    ent
+}
+
+/// Effective zpaq level for a chunk's literal stream under --auto-level.
+/// Thresholds are set where the ratio loss is negligible: measured on the
+/// benchmark corpus, literal streams at ~6.3-6.6 bits/byte still compress
+/// 3-4x at L3 while L1/L2 leave 18-24% on the table, so those stay at the
+/// requested level. Only near-incompressible streams (>= 7.0 bits/byte)
+/// drop, where L1 ≈ L3 ratio at ~6x the speed.
+fn effective_level(literal: &[u8], requested: u8, auto: bool) -> u8 {
+    if !auto {
+        return requested;
+    }
+    let ent = estimate_entropy(literal);
+    if std::env::var("LRZIP_DEBUG_ENTROPY").is_ok() {
+        eprintln!("[auto-level] literal {} bytes, entropy {:.3} bits/byte, requested L{}",
+            literal.len(), ent, requested);
+    }
+    if ent >= 7.6 {
+        1
+    } else if ent >= 7.0 {
+        2
+    } else {
+        requested
+    }
+}
+
 pub fn compress(args: &Args) -> Result<()> {
     let start_time = Instant::now();
     let input_data = if args.disable_mmap {
@@ -827,10 +880,12 @@ fn compress_chunk_to_buffer(
             encoder.finish()?
         }
         Backend::Zpaq => {
+            let requested = args.level.unwrap_or(3);
+            let eff = effective_level(&literal_stream, requested, args.auto_level);
             if let Some(method) = &args.method {
                 crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())
             } else {
-                crate::zpaq::compress(&literal_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+                crate::zpaq::compress(&literal_stream, eff, None, std::ptr::null_mut())
             }
         }
         Backend::Bzip2 => {

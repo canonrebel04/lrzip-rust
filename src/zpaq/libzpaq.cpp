@@ -42,6 +42,9 @@ See libzpaq.h for additional documentation.
 #include <vector>
 #include <stdexcept>
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 
 #ifdef unix

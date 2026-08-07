@@ -111,6 +111,13 @@ pub struct Args {
     #[arg(long = "method", value_name = "METHOD")]
     pub method: Option<String>,
 
+    /// Per-chunk entropy-based level selection: literal streams at >= 7.6
+    /// bits/byte drop to level 1, >= 7.0 to level 2 (near-incompressible
+    /// data: L1 ≈ L3 ratio at ~6x the speed). The control stream always
+    /// uses the requested level.
+    #[arg(long = "auto-level")]
+    pub auto_level: bool,
+
     /// Reversible pre-filter applied before the rzip stage.
     #[arg(long = "filter", value_enum, default_value_t = Filter::None)]
     pub filter: Filter,

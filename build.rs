@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/zpaq/libzpaq.cpp");
     println!("cargo:rerun-if-changed=src/zpaq/libzpaq.h");
     println!("cargo:rerun-if-env-changed=LRZIP_NOJIT");
+    println!("cargo:rerun-if-env-changed=LRZIP_NOOPENMP");
 
     let mut build = cc::Build::new();
     build
@@ -14,6 +15,15 @@ fn main() {
         .flag_if_supported("-mpclmul")
         .flag_if_supported("-msse4.2")
         .flag_if_supported("/arch:AVX2");
+
+    // Parallel divsufsort (suffix-array construction for -L2/-L3 LZ77-SA).
+    // The vendored libdivsufsort has #ifdef _OPENMP parallel sssort regions;
+    // they activate with -fopenmp (GCC/Clang) or /openmp (MSVC). The suffix
+    // array is a deterministic sort result regardless of thread count, so
+    // archives stay byte-identical. Set LRZIP_NOOPENMP=1 to force serial.
+    if std::env::var("LRZIP_NOOPENMP").is_err() {
+        build.flag_if_supported("-fopenmp").flag_if_supported("/openmp");
+    }
 
     // ZPAQL JIT is disabled by default. libzpaq's JIT miscompiles the L3
     // compression HCOMP program (SIGILL at -z -L3 compress; L1/L2 and
