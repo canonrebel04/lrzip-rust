@@ -32,15 +32,16 @@ fn main() {
     // per-call getenv() cache, L4/L5 momentum MIX update): JIT archives are
     // byte-identical to the interpreter at ALL levels (L1-L5, verified on
     // 11.6MB/92MB corpora AND the full 757MB RimWorld tar, round-trip
-    // byte-exact). BUT on this AVX2 fork the JIT is measured SLOWER, not
-    // faster: the interpreter's C++ find() uses the SIMD Swiss-table probe
-    // while the JIT inlines a scalar hash lookup. Full-corpus -z -L3 -t8,
-    // interleaved 2 reps: compress 134/123s (JIT) vs 78/77s (NOJIT);
-    // decompress 102/100s vs 56/56s; -t1 100MB slice: 42s vs 25s. So NOJIT
-    // stays the default (also upstream parity: lrzip-next configure.ac:194
-    // and the zpaq fork both build with -DNOJIT). Set LRZIP_JIT=1 to opt
-    // into JIT (byte-identical but slower on this fork), LRZIP_NOJIT=1 to
-    // force the interpreter explicitly.
+    // byte-exact). v0.23.0 AVX2-vectorized the MIX momentum UPDATE loop
+    // (8-wide, complemented VEX.vvvv, /4=PSRAD shift group, xmm-source
+    // vpbroadcastd) — L5 went from 1.8x SLOWER than the interpreter to
+    // PARITY (12s vs 12s on an 11.6MB slice at -t1); L3/L4 remain slower
+    // (L3 has no MIX; L4's MIX is m=7 < 8 so the scalar path runs and the
+    // 5x-ISSE find() dominates). Remaining gap for a JIT default flip:
+    // vectorize the JIT's find()/CM-predict hot paths (or accept the
+    // interpreter). Set LRZIP_JIT=1 to opt into JIT (byte-identical,
+    // L5-parity, L3/L4 slower on this fork), LRZIP_NOJIT=1 to force the
+    // interpreter explicitly.
     let force_jit = std::env::var("LRZIP_JIT").is_ok();
     let force_nojit = std::env::var("LRZIP_NOJIT").is_ok();
     if force_nojit || !force_jit {

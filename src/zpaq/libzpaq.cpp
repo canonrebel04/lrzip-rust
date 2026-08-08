@@ -4702,7 +4702,67 @@ int Predictor::assemble_p() {
           put3(0x8d1c83);              // lea ebx, [ebx+eax*4] ; &v[cxt]
         }
 
-        for (int k=0; k<cp[3]; ++k) {
+        // AVX2-vectorize the momentum weight update 8-wide, matching the
+        // interpreter's __m256i loop in update() case MIX exactly:
+        //   delta=(err*p+4096)>>13; v_new=(v_old>>1)+delta; v=v_new;
+        //   lookahead=v_new+((v_new-v_old)>>1); wt=clamp512k(wt+lookahead)
+        // (clamp = max(-524288) then min(524287), same order as the C++).
+        // Scalar tail handles m%8, and the 32-bit path stays fully scalar.
+        { const int m=cp[3];
+        int k=0;
+        if (S==8) {
+          // VEX encoding notes (validated against the compiler's own output):
+          //  - VEX.vvvv is stored 1's-complemented (~src1 for 3-op forms,
+          //    ~dest for shift-by-imm).
+          //  - vpbroadcastd's register source is XMM (or m32), NOT a GPR —
+          //    so materialize GPR constants via vmovd first.
+          // vmovd xmm0, ecx ; vpbroadcastd ymm0, xmm0 ; err
+          put3(0xc5f96e); put1(0xc1);                  // vmovd xmm0, ecx
+          put1(0xc4); put1(0xe2); put1(0x7d); put1(0x58); put1(0xc0);  // vpbroadcastd ymm0, xmm0
+          // mov eax, 1<<12 ; vmovd xmm1, eax ; vpbroadcastd ymm1, xmm1 ; bias
+          put1a(0xb8, 1<<12);
+          put3(0xc5f96e); put1(0xc8);                  // vmovd xmm1, eax
+          put1(0xc4); put1(0xe2); put1(0x7d); put1(0x58); put1(0xc9);  // vpbroadcastd ymm1, xmm1
+          // mov eax, -524288 ; vmovd xmm2, eax ; vpbroadcastd ymm2, xmm2 ; clamp min
+          put1a(0xb8, 0xfff80000);
+          put3(0xc5f96e); put1(0xd0);                  // vmovd xmm2, eax
+          put1(0xc4); put1(0xe2); put1(0x7d); put1(0x58); put1(0xd2);  // vpbroadcastd ymm2, xmm2
+          // mov eax, 524287 ; vmovd xmm3, eax ; vpbroadcastd ymm3, xmm3 ; clamp max
+          put1a(0xb8, 0x0007ffff);
+          put3(0xc5f96e); put1(0xd8);                  // vmovd xmm3, eax
+          put1(0xc4); put1(0xe2); put1(0x7d); put1(0x58); put1(0xdb);  // vpbroadcastd ymm3, xmm3
+
+          for (; k+8<=m; k+=8) {
+            // ymm4=v_old, ymm5=vwt, ymm6=vp, ymm7=v_new/lookahead
+            // VEX 3-op convention: vvvv=src1 (1's-complemented!), modrm.reg=dest,
+            // modrm.rm=src2. Shift-by-imm (vpsrad): vvvv=DEST (complemented),
+            // modrm.reg=/4 (empirically PSRAD on this CPU — /6 is PSLLD here),
+            // modrm.rm=SRC.
+            put1(0xc4); put1(0xc1); put1(0x7e); put1(0x6f); put1(0x20);  // vmovdqu ymm4, [r8]
+            put1(0xc4); put1(0xe1); put1(0x7e); put1(0x6f); put1(0x2e);  // vmovdqu ymm5, [esi]
+            put1(0xc4); put1(0xe1); put1(0x7e); put1(0x6f); put1(0xb7);
+            puta(off(p[cp[2]+k]));                                       // vmovdqu ymm6, [edi+&p[j+k]]
+            put1(0xc4); put1(0xe2); put1(0x4d); put1(0x40); put1(0xf0);  // vpmulld ymm6, ymm6, ymm0 ; err*p (~0110=1001)
+            put1(0xc4); put1(0xe1); put1(0x4d); put1(0xfe); put1(0xf1);  // vpaddd  ymm6, ymm6, ymm1 ; +bias
+            put1(0xc4); put1(0xe1); put1(0x4d); put1(0x72); put1(0xe6);
+            put1(0x0d);                                                  // vpsrad  ymm6, ymm6, 13 ; delta
+            put1(0xc4); put1(0xe1); put1(0x45); put1(0x72); put1(0xe4);
+            put1(0x01);                                                  // vpsrad  ymm7, ymm4, 1  ; v_old>>1 (~0111=1000)
+            put1(0xc4); put1(0xe1); put1(0x45); put1(0xfe); put1(0xfe);  // vpaddd  ymm7, ymm7, ymm6 ; v_new
+            put1(0xc4); put1(0xc1); put1(0x7e); put1(0x7f); put1(0x38);  // vmovdqu [r8], ymm7     ; v=v_new
+            put1(0xc4); put1(0xe1); put1(0x45); put1(0xfa); put1(0xf4);  // vpsubd  ymm6, ymm7, ymm4 ; v_new-v_old
+            put1(0xc4); put1(0xe1); put1(0x4d); put1(0x72); put1(0xe6);
+            put1(0x01);                                                  // vpsrad  ymm6, ymm6, 1
+            put1(0xc4); put1(0xe1); put1(0x45); put1(0xfe); put1(0xfe);  // vpaddd  ymm7, ymm7, ymm6 ; lookahead
+            put1(0xc4); put1(0xe1); put1(0x55); put1(0xfe); put1(0xef);  // vpaddd  ymm5, ymm5, ymm7 ; wt+lookahead (~0101=1010)
+            put1(0xc4); put1(0xe2); put1(0x55); put1(0x3d); put1(0xea);  // vpmaxsd ymm5, ymm5, ymm2 ; clamp min
+            put1(0xc4); put1(0xe2); put1(0x55); put1(0x39); put1(0xeb);  // vpminsd ymm5, ymm5, ymm3 ; clamp max
+            put1(0xc4); put1(0xe1); put1(0x7e); put1(0x7f); put1(0x2e);  // vmovdqu [esi], ymm5     ; wt=clamped
+            put1(0x49); put3(0x83c020);                                  // add r8, 32
+            put1(0x48); put3(0x83c620);                                  // add esi, 32
+          }
+        }
+        for (; k<m; ++k) {
           put2a(0x8b87,off(p[cp[2]+k]));//mov eax, [edi+&p[cp[2]+k]
           put3(0x0fafc1);              // imul eax, ecx ; err*p[j]
           put1a(0x05, 1<<12);          // add eax, 1<<12
@@ -4739,7 +4799,7 @@ int Predictor::assemble_p() {
           put2(0x7d05);                // jge L2
           put1a(0xb8, 0xfff80000);     // mov eax, -1<<19
           put2(0x8906);                // L2: mov [esi], eax
-          if (k<cp[3]-1) {
+          if (k<m-1) {
             if (S==8) put1(0x48);      // rex.w
             put3(0x83c604);            // add esi, 4
             if (S==8) {
@@ -4749,6 +4809,7 @@ int Predictor::assemble_p() {
               put3(0x83c304);          // add ebx, 4
             }
           }
+        }
         }
         break;
 
@@ -4768,6 +4829,7 @@ int Predictor::assemble_p() {
   }
 
   // return from update()
+  put3(0xc5f877);             // vzeroupper (MIX update uses AVX2 ymm)
   put1(0x5f);                 // pop edi
   put1(0x5e);                 // pop esi
   put1(0x5d);                 // pop ebp
@@ -5048,6 +5110,9 @@ void Predictor::update(int y) {
         if (first_comp >= 0) {
           int fc = first_comp;
           fprintf(stderr, "  comp%d cxt: jit=%zu int=%zu\n", fc, cxt_jit[fc], comp[fc].cxt);
+          fprintf(stderr, "  comp%d sizes: cm=%zu a16=%zu v=%zu c=%zu | n_prog=%d\n",
+                  fc, comp[fc].cm.size(), comp[fc].a16.size(), comp[fc].v.size(),
+                  comp[fc].c, z.header[6]);
           size_t diffat = SIZE_MAX;
           for (size_t j = 0; j < cms[fc].n; ++j)
             if (cm_post_jit[fc][j] != ((U8*)comp[fc].cm.get_aligned_data())[j]) { diffat = j; break; }
