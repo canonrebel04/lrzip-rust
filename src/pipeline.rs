@@ -186,18 +186,22 @@ pub fn decompress(args: &Args) -> Result<()> {
         .build()
         .context("failed to build decompression thread pool")?;
 
+    let pb_ref = pb.as_ref();
     let chunk_results: Vec<Result<(usize, Vec<u8>)>> = pool.install(|| {
         chunk_locs
             .par_iter()
             .enumerate()
             .map(|(idx, (offset, rcd))| {
-                decompress_chunk(rcd, bytes, *offset, encrypted, args.encrypt.as_deref())
-                    .map(|data| (idx, data))
+                let res = decompress_chunk(rcd, bytes, *offset, encrypted, args.encrypt.as_deref());
+                if let (Ok(data), Some(pb)) = (&res, pb_ref) {
+                    pb.inc(data.len() as u64);
+                }
+                res.map(|data| (idx, data))
             })
             .collect()
     });
 
-    // Pass 3 (serial): inverse-filter, postprocess, hash raw, write, progress.
+    // Pass 3 (serial): inverse-filter, postprocess, hash raw, write.
     for result in chunk_results {
         let (_, mut rzip_chunk_data) = result?;
 
@@ -219,10 +223,6 @@ pub fn decompress(args: &Args) -> Result<()> {
         }
 
         out_file.write_all(write_data)?;
-
-        if let Some(ref pb) = pb {
-            pb.inc(write_data.len() as u64);
-        }
     }
 
     if let Some(pb) = pb {
@@ -836,7 +836,6 @@ fn compress_chunk_to_buffer(
                     literal_stream.extend_from_slice(&chunk_data[current_lit_pos..current_lit_pos + cur_len as usize]);
                     current_lit_pos += cur_len as usize;
                     len -= cur_len;
-                    pb.inc(cur_len as u64);
                 }
             }
             RzipControl::Match { mut len, mut offset } => {
@@ -850,7 +849,6 @@ fn compress_chunk_to_buffer(
                     current_lit_pos += cur_len as usize;
                     len -= cur_len;
                     offset += cur_len as u64;
-                    pb.inc(cur_len as u64);
                 }
             }
         }
@@ -1064,6 +1062,8 @@ fn compress_chunk_to_buffer(
     // Write Stream 1 Data Block
     write_fields(&mut *out, if encrypted { Some(&literal_salt) } else { None }, s1_ctype, literal_compressed.len() as u64, literal_stream.len() as u64, 0)?;
     out.write_all(&literal_compressed)?;
+
+    pb.inc(chunk_spec.size);
 
     Ok(())
 }

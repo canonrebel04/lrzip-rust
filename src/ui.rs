@@ -21,12 +21,12 @@ pub fn parse_size(s: &str) -> Option<usize> {
 pub fn format_size(bytes: u64) -> String {
     const UNIT: u64 = 1000;
     if bytes < UNIT {
-        return format!("{} B", bytes).cyan().to_string();
+        return format!("{} B", bytes);
     }
     let exp = (bytes as f64).log(UNIT as f64) as i32;
     let pre = "kMGTPE".chars().nth((exp - 1) as usize).unwrap_or('?');
     let val = bytes as f64 / (UNIT as f64).powi(exp);
-    format!("{:.2} {}B", val, pre).cyan().bold().to_string()
+    format!("{:.2} {}B", val, pre)
 }
 
 pub fn format_duration(d: Duration) -> String {
@@ -39,7 +39,7 @@ pub fn format_duration(d: Duration) -> String {
         let min = (secs / 60.0).floor();
         let s = secs % 60.0;
         format!("{:.0}m {:.0}s", min, s)
-    }.yellow().to_string()
+    }
 }
 
 pub fn print_summary(
@@ -54,15 +54,12 @@ pub fn print_summary(
         0.0
     };
     
-    let box_width = 50;
-    // content width inside │...│ is box_width - 2
-    let content_width = box_width - 2;
+    let content_width = 48;
     
     // Title styling
     let raw_title = format!(" {} Summary ", action);
     let styled_title = raw_title.clone().bold().white().on_blue().to_string();
     
-    // Calculate padding manually because ANSI codes mess up format!'s width props
     let title_visible_len = raw_title.len(); 
     let pad_total = if content_width > title_visible_len { content_width - title_visible_len } else { 0 };
     let pad_left = pad_total / 2;
@@ -86,17 +83,36 @@ pub fn print_summary(
     // Spacer
     println!("{} {:width$} {}", "│".blue(), "", "│".blue(), width = content_width);
 
-    let row = |label: &str, value: String| {
-        // Label col: 15 chars, Value col: 31 chars. Total 46. Spaces: 1 before, 1 between, 1 after?
-        // Let's do: "  Label:       Value  "
-        // Fixed layout: " {:<15} {:>31} " is 48 chars. Perfect.
-        println!("{} {:<15} {:>31} {}", "│".blue(), label.bold().white(), value, "│".blue());
+    let row = |label: &str, raw_val: &str, styled_val: ColoredString| {
+        let inner_width = content_width - 4; // 2 spaces left, 2 spaces right
+        let label_len = label.len();
+        let val_len = raw_val.len();
+        let pad_len = if inner_width > (label_len + val_len) {
+            inner_width - label_len - val_len
+        } else {
+            1
+        };
+        println!(
+            "{}  {} {} {}  {}",
+            "│".blue(),
+            label.bold().white(),
+            " ".repeat(pad_len),
+            styled_val,
+            "│".blue()
+        );
     };
 
-    row("Original Size:", format_size(original_size));
-    row("Final Size:", format_size(compressed_size));
-    row("Ratio:", format!("{:.2}x", ratio).green().bold().to_string());
-    row("Time:", format_duration(duration));
+    let orig_raw = format_size(original_size);
+    row("Original Size:", &orig_raw, orig_raw.cyan().bold());
+
+    let final_raw = format_size(compressed_size);
+    row("Final Size:", &final_raw, final_raw.cyan().bold());
+
+    let ratio_raw = format!("{:.2}x", ratio);
+    row("Ratio:", &ratio_raw, ratio_raw.green().bold());
+
+    let dur_raw = format_duration(duration);
+    row("Time:", &dur_raw, dur_raw.yellow());
     
     // Spacer
     println!("{} {:width$} {}", "│".blue(), "", "│".blue(), width = content_width);
