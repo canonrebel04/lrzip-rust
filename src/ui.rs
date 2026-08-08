@@ -68,20 +68,20 @@ pub fn print_summary(
     let horizontal = "─".repeat(content_width);
     
     // Top border
-    println!("{}", format!("╭{}╮", horizontal).blue());
+    println!("{}", format!("╭{}╮", horizontal).cyan());
     
     // Title row
     println!(
         "{} {}{}{} {}", 
-        "│".blue(), 
+        "│".cyan(), 
         " ".repeat(pad_left), 
         styled_title, 
         " ".repeat(pad_right), 
-        "│".blue()
+        "│".cyan()
     ); 
     
     // Spacer
-    println!("{} {:width$} {}", "│".blue(), "", "│".blue(), width = content_width);
+    println!("{} {} {}", "│".cyan(), " ".repeat(content_width), "│".cyan());
 
     let row = |label: &str, raw_val: &str, styled_val: ColoredString| {
         let inner_width = content_width - 4; // 2 spaces left, 2 spaces right
@@ -94,11 +94,11 @@ pub fn print_summary(
         };
         println!(
             "{}  {} {} {}  {}",
-            "│".blue(),
+            "│".cyan(),
             label.bold().white(),
             " ".repeat(pad_len),
             styled_val,
-            "│".blue()
+            "│".cyan()
         );
     };
 
@@ -115,7 +115,7 @@ pub fn print_summary(
     row("Time:", &dur_raw, dur_raw.yellow());
     
     // Spacer
-    println!("{} {:width$} {}", "│".blue(), "", "│".blue(), width = content_width);
+    println!("{} {} {}", "│".cyan(), " ".repeat(content_width), "│".cyan());
     // Bottom border
-    println!("{}", format!("╰{}╯", horizontal).blue());
+    println!("{}", format!("╰{}╯", horizontal).cyan());
 }
