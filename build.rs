@@ -27,13 +27,20 @@ fn main() {
         build.flag_if_supported("-fopenmp").flag_if_supported("/openmp");
     }
 
-    // ZPAQL JIT is disabled by default. libzpaq's JIT miscompiles the L3
-    // compression HCOMP program (SIGILL at -z -L3 compress; L1/L2 and
-    // decompression work). Both upstream projects force the interpreter:
-    // lrzip-next configure.ac:194 "must use -DNOJIT for compiling zpaq"
-    // and the zpaq fork's own Makefile uses -DNOJIT. This is the parity
-    // configuration. Set LRZIP_JIT=1 to opt into JIT (for L1/L2 or after
-    // a fork-level JIT assembler fix), LRZIP_NOJIT=1 to force interpreter.
+    // ZPAQL JIT is opt-in; the interpreter is the default build. The JIT
+    // assembler is FIXED since a00c2fb (SIB-byte bug in the v-pointer load,
+    // per-call getenv() cache, L4/L5 momentum MIX update): JIT archives are
+    // byte-identical to the interpreter at ALL levels (L1-L5, verified on
+    // 11.6MB/92MB corpora AND the full 757MB RimWorld tar, round-trip
+    // byte-exact). BUT on this AVX2 fork the JIT is measured SLOWER, not
+    // faster: the interpreter's C++ find() uses the SIMD Swiss-table probe
+    // while the JIT inlines a scalar hash lookup. Full-corpus -z -L3 -t8,
+    // interleaved 2 reps: compress 134/123s (JIT) vs 78/77s (NOJIT);
+    // decompress 102/100s vs 56/56s; -t1 100MB slice: 42s vs 25s. So NOJIT
+    // stays the default (also upstream parity: lrzip-next configure.ac:194
+    // and the zpaq fork both build with -DNOJIT). Set LRZIP_JIT=1 to opt
+    // into JIT (byte-identical but slower on this fork), LRZIP_NOJIT=1 to
+    // force the interpreter explicitly.
     let force_jit = std::env::var("LRZIP_JIT").is_ok();
     let force_nojit = std::env::var("LRZIP_NOJIT").is_ok();
     if force_nojit || !force_jit {
