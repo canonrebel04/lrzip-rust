@@ -16,6 +16,12 @@ A high-performance, safe Rust rewrite of the `lrzip` compression utility, design
 
 ## Installation
 
+### Windows (installer)
+
+Grab `lrzip-rust-setup.exe` from the latest release. It installs to `%LOCALAPPDATA%\Programs\lrzip-rust`, adds itself to the user PATH, and registers in Add/Remove Programs (uninstaller included).
+
+### From source
+
 ```bash
 cargo install --path .
 ```

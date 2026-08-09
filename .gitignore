@@ -18,3 +18,7 @@ out_*.txt
 # Release artifacts
 *.zip
 *.tar.gz
+installer/lrzip-rust-setup.exe
+
+# graphify knowledge graph artifacts
+graphify-out/

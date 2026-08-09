@@ -39,7 +39,16 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           powershell Compress-Archive -Path target/${{ matrix.target }}/release/lrzip-rust.exe -DestinationPath ${{ matrix.asset_name }}
-          
+
+      - name: Build Windows Installer
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File installer/build-installer.ps1 `
+            -ExePath "target/${{ matrix.target }}/release/lrzip-rust.exe" `
+            -Version "${{ github.ref_name }}" `
+            -OutDir "."
+
       - name: Package Linux
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -49,5 +58,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows Installer
+        if: matrix.os == 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lrzip-rust-setup.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
