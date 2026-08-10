@@ -746,16 +746,27 @@ pub fn compress(args: &Args) -> Result<()> {
         .unwrap()
         .progress_chars("#>-"));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    
+    pb.set_message("reading input for header MD5");
+
     let mut md5_ctx = md5::Context::new();
     // File-level MD5 is computed with a single serial pass over the input.
-    // MD5 is not incrementally parallelizable (non-Merkle hash), and one pass
-    // over the mmap is ~1s per GB — negligible vs the compression stage.
-    md5_ctx.consume(bytes);
+    // MD5 is not incrementally parallelizable (non-Merkle hash), so this is
+    // one sequential read of the whole file — on slow drives (USB HDD etc.)
+    // it dominates startup, hence the progress bar above. Slice-consume so
+    // the bar advances instead of stalling silently.
+    const MD5_SLICE: usize = 64 * 1024 * 1024;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let end = (off + MD5_SLICE).min(bytes.len());
+        md5_ctx.consume(&bytes[off..end]);
+        pb.inc((end - off) as u64);
+        off = end;
+    }
 
     pb.set_message(format!("Compressing {} chunks with {} threads",
         chunk_map.chunks.len(),
         threads));
+    pb.set_position(0); // MD5 pass ran on the same bar; restart for compression
 
     // Thread pool honoring -t/--threads (memory-capped above). Each chunk is
     // independent: it owns its rolling hash, hash table, and backend
