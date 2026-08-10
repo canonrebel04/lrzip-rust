@@ -623,6 +623,41 @@ pub fn compress(args: &Args) -> Result<()> {
         100 * 1024 * 1024 // Default 100MB
     };
 
+    // Memory-aware concurrency (automatic by default): each chunk runs a
+    // full zpaq backend (stream copies + suffix-array sort + model tables,
+    // ~8-10x the chunk size at L2/L3), so the naive core-count default can
+    // OOM on big archives (see src/mem.rs). Cap threads to what fits in
+    // available RAM; shrink the zpaq block size if even one thread is tight.
+    let requested_threads = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let level_for_est = args.level.unwrap_or(3);
+    let avail_mem = crate::mem::available_memory_bytes();
+    let (threads, auto_zpaqbs) = crate::mem::memory_safe_threads(
+        requested_threads,
+        window_size as u64,
+        level_for_est,
+        avail_mem,
+    );
+    let zpaqbs_effective = auto_zpaqbs.unwrap_or(args.zpaqbs);
+    if threads < requested_threads {
+        let per = crate::mem::estimate_chunk_peak(window_size as u64, level_for_est) / (1024 * 1024);
+        eprintln!(
+            "memory-aware: capping concurrency at {} (est. {} MiB per chunk, {} MiB available){}",
+            threads,
+            per,
+            avail_mem / (1024 * 1024),
+            if args.threads.is_some() {
+                " — pass -t with a lower value or --zpaqbs to override"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(mb) = auto_zpaqbs {
+        eprintln!("memory-aware: shrinking zpaq blocks to {} MiB to fit memory", mb);
+    }
+
     // Prepare Magic Header
     let magic = MagicHeader {
         major: 0,
@@ -669,9 +704,10 @@ pub fn compress(args: &Args) -> Result<()> {
                         .unwrap_or(3)
                 }),
                 // Block size code = log2(MiB), capped at 15 (byte 18's low
-                // nibble). 0 = default (one block per input chunk).
-                block_size: if args.zpaqbs > 0 {
-                    (31 - args.zpaqbs.leading_zeros()).min(15) as u8
+                // nibble). 0 = default (one block per input chunk). The
+                // memory-aware auto block size overrides the CLI default.
+                block_size: if zpaqbs_effective > 0 {
+                    (31 - zpaqbs_effective.leading_zeros()).min(15) as u8
                 } else {
                     0
                 },
@@ -719,16 +755,14 @@ pub fn compress(args: &Args) -> Result<()> {
 
     pb.set_message(format!("Compressing {} chunks with {} threads",
         chunk_map.chunks.len(),
-        args.threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))));
+        threads));
 
-    // Thread pool honoring -t/--threads. Each chunk is independent: it owns
-    // its rolling hash, hash table, and backend compressor state, so chunks
-    // can be compressed concurrently. Output order is preserved by index.
+    // Thread pool honoring -t/--threads (memory-capped above). Each chunk is
+    // independent: it owns its rolling hash, hash table, and backend
+    // compressor state, so chunks can be compressed concurrently. Output
+    // order is preserved by index.
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(
-            args.threads
-                .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)),
-        )
+        .num_threads(threads)
         .build()
         .context("failed to build compression thread pool")?;
 
@@ -739,7 +773,7 @@ pub fn compress(args: &Args) -> Result<()> {
             .enumerate()
             .map(|(idx, chunk)| {
                 let mut chunk_out = Vec::new();
-                compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &pb)
+                compress_chunk_to_buffer(bytes, chunk, &rzip_config, &mut chunk_out, args, &pb, zpaqbs_effective)
                     .map(|_| (idx, chunk_out))
             })
             .collect()
@@ -781,6 +815,7 @@ fn compress_chunk_to_buffer(
     out: &mut Vec<u8>,
     args: &Args,
     pb: &ProgressBar,
+    zpaqbs: u32,
 ) -> Result<()> {
     use crate::rzip::{compress_chunk, RzipControl};
     use crate::format::write_var_le;
@@ -961,8 +996,8 @@ fn compress_chunk_to_buffer(
             let eff = effective_level(&literal_stream, requested, args.auto_level);
             if let Some(method) = &args.method {
                 crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())?
-            } else if args.zpaqbs > 0 {
-                crate::zpaq::compress_block(&literal_stream, eff, args.zpaqbs, None, std::ptr::null_mut())?
+            } else if zpaqbs > 0 {
+                crate::zpaq::compress_block(&literal_stream, eff, zpaqbs, None, std::ptr::null_mut())?
             } else {
                 crate::zpaq::compress(&literal_stream, eff, None, std::ptr::null_mut())?
             }

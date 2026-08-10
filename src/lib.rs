@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod filter;
 pub mod format;
+pub mod mem;
 pub mod pipeline;
 pub mod rzip;
 pub mod ui;
