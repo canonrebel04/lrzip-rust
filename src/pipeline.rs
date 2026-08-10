@@ -82,6 +82,37 @@ pub fn execute(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// File-level integrity hash used by decompress. BLAKE3 is the default for
+/// new archives; MD5 is still validated for older archives (hash kind byte 1).
+enum FileHash {
+    Md5(md5::Context),
+    Blake3(blake3::Hasher),
+}
+
+impl FileHash {
+    fn new(kind: HashKind) -> Option<FileHash> {
+        match kind {
+            HashKind::Md5 => Some(FileHash::Md5(md5::Context::new())),
+            HashKind::Blake3 => Some(FileHash::Blake3(blake3::Hasher::new())),
+            _ => None,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            FileHash::Md5(c) => { c.consume(data); }
+            FileHash::Blake3(h) => { h.update(data); }
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            FileHash::Md5(c) => c.finalize().0.to_vec(),
+            FileHash::Blake3(h) => h.finalize().as_bytes().to_vec(),
+        }
+    }
+}
+
 pub fn decompress(args: &Args) -> Result<()> {
     let input_data = if args.disable_mmap {
         let buf = std::fs::read(&args.input)
@@ -121,11 +152,7 @@ pub fn decompress(args: &Args) -> Result<()> {
     let mut out_file = File::create(&output_path)
         .with_context(|| format!("create output file {}", output_path.display()))?;
 
-    let mut md5_ctx = if magic.hash == HashKind::Md5 {
-        Some(md5::Context::new())
-    } else {
-        None
-    };
+    let mut file_hash = FileHash::new(magic.hash);
 
     let pb = if let Some(size) = magic.expected_size {
         if !args.quiet {
@@ -216,10 +243,10 @@ pub fn decompress(args: &Args) -> Result<()> {
         let postprocessed = crate::preprocess::postprocess(&rzip_chunk_data);
         let write_data = if postprocessed.is_empty() { &rzip_chunk_data } else { &postprocessed };
 
-        // File MD5 covers the raw stream (== the compressor's hashed input),
+        // File hash covers the raw stream (== the compressor's hashed input),
         // so hash the post-preprocess output.
-        if let Some(ctx) = &mut md5_ctx {
-            ctx.consume(write_data);
+        if let Some(h) = &mut file_hash {
+            h.update(write_data);
         }
 
         out_file.write_all(write_data)?;
@@ -236,10 +263,10 @@ pub fn decompress(args: &Args) -> Result<()> {
         } else {
             let stored_hash = &bytes[cursor..cursor+len];
             
-            if let Some(ctx) = md5_ctx {
-                let digest = ctx.finalize();
-                if digest.0 != stored_hash {
-                     bail!("MD5 mismatch: expected {:02x?}, calculated {:02x?}", stored_hash, digest.0);
+            if let Some(h) = file_hash {
+                let digest = h.finalize();
+                if digest != stored_hash {
+                    bail!("{} mismatch: expected {:02x?}, calculated {:02x?}", format_hash(magic.hash), stored_hash, digest);
                 }
             } else if magic.hash != HashKind::Crc && magic.hash != HashKind::Unknown(0) {
                  eprintln!("Warning: Verification for hash {} not supported yet", format_hash(magic.hash));
@@ -673,7 +700,7 @@ pub fn compress(args: &Args) -> Result<()> {
         } else {
             None
         },
-        hash: HashKind::Md5,
+        hash: HashKind::Blake3,
         filter: match args.filter {
             crate::cli::Filter::X86 => FilterSpec::Bcj(BcjFilter::X86),
             crate::cli::Filter::None => FilterSpec::None,
@@ -746,19 +773,20 @@ pub fn compress(args: &Args) -> Result<()> {
         .unwrap()
         .progress_chars("#>-"));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb.set_message("reading input for header MD5");
+    pb.set_message("reading input for header BLAKE3");
 
-    let mut md5_ctx = md5::Context::new();
-    // File-level MD5 is computed with a single serial pass over the input.
-    // MD5 is not incrementally parallelizable (non-Merkle hash), so this is
-    // one sequential read of the whole file — on slow drives (USB HDD etc.)
-    // it dominates startup, hence the progress bar above. Slice-consume so
-    // the bar advances instead of stalling silently.
-    const MD5_SLICE: usize = 64 * 1024 * 1024;
+    // File-level checksum is computed with a single serial pass over the
+    // input. BLAKE3 is not incrementally parallelizable, so this is one
+    // sequential read of the whole file — on slow drives (USB HDD etc.) it
+    // dominates startup, hence the progress bar above. Slice-consume so the
+    // bar advances instead of stalling silently. (BLAKE3: 256-bit output,
+    // cryptographically sound, ~2-8 GB/s vs MD5's ~0.6-1 GB/s.)
+    let mut file_hash = blake3::Hasher::new();
+    const HASH_SLICE: usize = 64 * 1024 * 1024;
     let mut off = 0usize;
     while off < bytes.len() {
-        let end = (off + MD5_SLICE).min(bytes.len());
-        md5_ctx.consume(&bytes[off..end]);
+        let end = (off + HASH_SLICE).min(bytes.len());
+        file_hash.update(&bytes[off..end]);
         pb.inc((end - off) as u64);
         off = end;
     }
@@ -800,8 +828,7 @@ pub fn compress(args: &Args) -> Result<()> {
     pb.finish_with_message("Compression complete");
 
     if !args.benchmark {
-        let digest = md5_ctx.finalize();
-        out_file.write_all(&digest.0)?;
+        out_file.write_all(file_hash.finalize().as_bytes())?;
     }
 
 
@@ -1179,6 +1206,7 @@ fn format_hash(hash: HashKind) -> &'static str {
         HashKind::Shake256_16 => "SHAKE256-16",
         HashKind::Shake256_32 => "SHAKE256-32",
         HashKind::Shake256_64 => "SHAKE256-64",
+        HashKind::Blake3 => "BLAKE3",
         HashKind::Unknown(_) => "Unknown",
     }
 }

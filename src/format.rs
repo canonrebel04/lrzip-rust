@@ -62,6 +62,7 @@ pub enum HashKind {
     Shake256_16,
     Shake256_32,
     Shake256_64,
+    Blake3,
     Unknown(u8),
 }
 
@@ -82,6 +83,7 @@ impl From<u8> for HashKind {
             11 => HashKind::Shake256_16,
             12 => HashKind::Shake256_32,
             13 => HashKind::Shake256_64,
+            14 => HashKind::Blake3,
             other => HashKind::Unknown(other),
         }
     }
@@ -299,6 +301,7 @@ impl MagicHeader {
             HashKind::Shake256_16 => 11,
             HashKind::Shake256_32 => 12,
             HashKind::Shake256_64 => 13,
+            HashKind::Blake3 => 14,
             HashKind::Unknown(c) => c,
         };
 
@@ -664,6 +667,7 @@ fn hash_len(hash: HashKind) -> Option<usize> {
         HashKind::Shake256_16 => Some(16),
         HashKind::Shake256_32 => Some(32),
         HashKind::Shake256_64 => Some(64),
+        HashKind::Blake3 => Some(32),
         HashKind::Unknown(_) => None,
     }
 }
