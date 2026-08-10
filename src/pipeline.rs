@@ -119,10 +119,7 @@ pub fn decompress(args: &Args) -> Result<()> {
             .with_context(|| format!("read input file {}", args.input.display()))?;
         InputData::Buffer(buf)
     } else {
-        let file = File::open(&args.input)
-            .with_context(|| format!("open input file {}", args.input.display()))?;
-        let map = unsafe { Mmap::map(&file).context("mmap input file")? };
-        InputData::Mmap(map)
+        InputData::Mmap(open_input_mmap(&args.input)?)
     };
 
     let bytes = input_data.as_slice();
@@ -612,6 +609,30 @@ fn lzo_decompress_safe(data: &[u8], expected: usize) -> anyhow::Result<Vec<u8>> 
     Ok(dst)
 }
 
+/// Open the input file and mmap it. On Windows the handle is opened with
+/// FILE_FLAG_SEQUENTIAL_SCAN (0x08000000) so the cache manager evicts
+/// pages after they're read — otherwise a huge input (e.g. a 58GB tar)
+/// balloons the OS page cache to the file size and the machine looks OOM
+/// while the program itself holds only a small working set.
+fn open_input_mmap(path: &std::path::Path) -> Result<memmap2::Mmap> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0800_0000) // FILE_FLAG_SEQUENTIAL_SCAN
+            .open(path)
+            .with_context(|| format!("open input file {}", path.display()))?;
+        unsafe { Mmap::map(&file).context("mmap input file") }
+    }
+    #[cfg(not(windows))]
+    {
+        let file = File::open(path)
+            .with_context(|| format!("open input file {}", path.display()))?;
+        unsafe { Mmap::map(&file).context("mmap input file") }
+    }
+}
+
 pub fn compress(args: &Args) -> Result<()> {
     let start_time = Instant::now();
     let input_data = if args.disable_mmap {
@@ -619,10 +640,7 @@ pub fn compress(args: &Args) -> Result<()> {
             .with_context(|| format!("read input file {}", args.input.display()))?;
         InputData::Buffer(buf)
     } else {
-        let file = File::open(&args.input)
-            .with_context(|| format!("open input file {}", args.input.display()))?;
-        let map = unsafe { Mmap::map(&file).context("mmap input file")? };
-        InputData::Mmap(map)
+        InputData::Mmap(open_input_mmap(&args.input)?)
     };
 
     let raw_bytes = input_data.as_slice();
@@ -659,21 +677,22 @@ pub fn compress(args: &Args) -> Result<()> {
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
     let level_for_est = args.level.unwrap_or(3);
-    let avail_mem = crate::mem::available_memory_bytes();
+    let total_ram = crate::mem::total_memory_bytes();
     let (threads, auto_zpaqbs) = crate::mem::memory_safe_threads(
         requested_threads,
         window_size as u64,
         level_for_est,
-        avail_mem,
+        total_ram,
     );
     let zpaqbs_effective = auto_zpaqbs.unwrap_or(args.zpaqbs);
     if threads < requested_threads {
         let per = crate::mem::estimate_chunk_peak(window_size as u64, level_for_est) / (1024 * 1024);
         eprintln!(
-            "memory-aware: capping concurrency at {} (est. {} MiB per chunk, {} MiB available){}",
+            "memory-aware: capping concurrency at {} (est. {} MiB per chunk, hard limit {} MiB = 50% of {} MiB RAM){}",
             threads,
             per,
-            avail_mem / (1024 * 1024),
+            (total_ram / 2) / (1024 * 1024),
+            total_ram / (1024 * 1024),
             if args.threads.is_some() {
                 " — pass -t with a lower value or --zpaqbs to override"
             } else {
