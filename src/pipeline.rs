@@ -359,7 +359,7 @@ fn decompress_chunk(
                         out
                     }
                     crate::format::CTYPE_ZPAQ => {
-                        crate::zpaq::decompress(compressed_data, block.uncompressed_len as usize, None, std::ptr::null_mut())
+                        crate::zpaq::decompress(compressed_data, block.uncompressed_len as usize, None, std::ptr::null_mut())?
                     }
                     crate::format::CTYPE_BZIP2 => {
                         let mut decoder = bzip2::read::BzDecoder::new(compressed_data);
@@ -912,9 +912,9 @@ fn compress_chunk_to_buffer(
         }
         Backend::Zpaq => {
             if let Some(method) = &args.method {
-                crate::zpaq::compress_method(&control_stream, method, None, std::ptr::null_mut())
+                crate::zpaq::compress_method(&control_stream, method, None, std::ptr::null_mut())?
             } else {
-                crate::zpaq::compress(&control_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())
+                crate::zpaq::compress(&control_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())?
             }
         }
         Backend::Bzip2 => {
@@ -960,11 +960,11 @@ fn compress_chunk_to_buffer(
             let requested = args.level.unwrap_or(3);
             let eff = effective_level(&literal_stream, requested, args.auto_level);
             if let Some(method) = &args.method {
-                crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())
+                crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())?
             } else if args.zpaqbs > 0 {
-                crate::zpaq::compress_block(&literal_stream, eff, args.zpaqbs, None, std::ptr::null_mut())
+                crate::zpaq::compress_block(&literal_stream, eff, args.zpaqbs, None, std::ptr::null_mut())?
             } else {
-                crate::zpaq::compress(&literal_stream, eff, None, std::ptr::null_mut())
+                crate::zpaq::compress(&literal_stream, eff, None, std::ptr::null_mut())?
             }
         }
         Backend::Bzip2 => {

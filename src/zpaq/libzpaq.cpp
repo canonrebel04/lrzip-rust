@@ -8294,7 +8294,24 @@ void compressBlock(StringBuffer* in, Writer* out, const char* method_,
 
 extern "C" {
 
-void zpaq_compress(
+// Exception-safe FFI: libzpaq reports errors by throwing std::runtime_error
+// (error(), which prints "libzpaq error: <msg>" to stderr first). Without a
+// catch here the exception unwinds through the C ABI into Rust and the
+// process aborts with "Rust cannot catch foreign exceptions" — the failure
+// mode the user hit on a 58GB archive ("libzpaq error: Out of memory").
+// Every entry point returns int: 0 = ok, 1 = libzpaq error (message already
+// on stderr), 2 = unknown exception. Rust checks the status and surfaces a
+// clean error instead of aborting.
+
+static int zpaq_report_error(const std::exception& e) {
+  const char* m = e.what();
+  if (strstr(m, "Out of memory") || strstr(m, "allocx failed"))
+    fprintf(stderr, "  hint: out of memory - retry with fewer threads (-t 8) "
+                    "or smaller zpaq blocks (--zpaqbs 32)\n");
+  return 1;
+}
+
+int zpaq_compress(
     unsigned char *c_buf,
     int64_t *c_len,
     const unsigned char *s_buf,
@@ -8304,22 +8321,33 @@ void zpaq_compress(
     void *userdata,
     int64_t thread
 ) {
+  try {
     libzpaq::StringBuffer in, out;
     in.write((const char*)s_buf, s_len);
-    
+
     char method[16];
     snprintf(method, sizeof(method), "%d", level);
     libzpaq::compress(&in, &out, method);
-    
+
     int64_t out_len = out.size();
     memcpy(c_buf, out.data(), out_len);
     *c_len = out_len;
+    return 0;
+  }
+  catch (const std::bad_alloc&) {
+    fprintf(stderr, "libzpaq error: Out of memory\n");
+    fprintf(stderr, "  hint: out of memory - retry with fewer threads (-t 8) "
+                    "or smaller zpaq blocks (--zpaqbs 32)\n");
+    return 1;
+  }
+  catch (const std::exception& e) { return zpaq_report_error(e); }
+  catch (...) { fprintf(stderr, "libzpaq error: unknown exception\n"); return 2; }
 }
 
 // Method-string variant: passes an arbitrary zpaq method (e.g. a level digit
 // 0-9, or an advanced config like "x6.2.12.0.7.27.1c0,0,511i2") straight to
 // libzpaq::compress. Used by --method passthrough.
-void zpaq_compress_method(
+int zpaq_compress_method(
     unsigned char *c_buf,
     int64_t *c_len,
     const unsigned char *s_buf,
@@ -8329,14 +8357,25 @@ void zpaq_compress_method(
     void *userdata,
     int64_t thread
 ) {
+  try {
     libzpaq::StringBuffer in, out;
     in.write((const char*)s_buf, s_len);
-    
+
     libzpaq::compress(&in, &out, method);
-    
+
     int64_t out_len = out.size();
     memcpy(c_buf, out.data(), out_len);
     *c_len = out_len;
+    return 0;
+  }
+  catch (const std::bad_alloc&) {
+    fprintf(stderr, "libzpaq error: Out of memory\n");
+    fprintf(stderr, "  hint: out of memory - retry with fewer threads (-t 8) "
+                    "or smaller zpaq blocks (--zpaqbs 32)\n");
+    return 1;
+  }
+  catch (const std::exception& e) { return zpaq_report_error(e); }
+  catch (...) { fprintf(stderr, "libzpaq error: unknown exception\n"); return 2; }
 }
 
 // Block-size variant (C++ lrzip's -zpaqbs): compresses the input in blocks
@@ -8345,7 +8384,7 @@ void zpaq_compress_method(
 // block's size, so 2-16MB blocks give small, fast models and 128MB+ give
 // larger, stronger ones. The zpaq decompressor reads blocks until the
 // stream is exhausted, so multi-block output stays self-describing.
-void zpaq_compress_block(
+int zpaq_compress_block(
     unsigned char *c_buf,
     int64_t *c_len,
     const unsigned char *s_buf,
@@ -8356,13 +8395,14 @@ void zpaq_compress_block(
     void *userdata,
     int64_t thread
 ) {
+  try {
     char method[16];
     snprintf(method, sizeof(method), "%d", level);
 
     const int64_t block_bytes = int64_t(block_mb) << 20;
     if (block_bytes <= 0) {
         *c_len = 0;
-        return;
+        return 0;
     }
 
     libzpaq::StringBuffer out;
@@ -8379,9 +8419,19 @@ void zpaq_compress_block(
     int64_t out_len = out.size();
     memcpy(c_buf, out.data(), out_len);
     *c_len = out_len;
+    return 0;
+  }
+  catch (const std::bad_alloc&) {
+    fprintf(stderr, "libzpaq error: Out of memory\n");
+    fprintf(stderr, "  hint: out of memory - retry with fewer threads (-t 8) "
+                    "or smaller zpaq blocks (--zpaqbs 32)\n");
+    return 1;
+  }
+  catch (const std::exception& e) { return zpaq_report_error(e); }
+  catch (...) { fprintf(stderr, "libzpaq error: unknown exception\n"); return 2; }
 }
 
-void zpaq_decompress(
+int zpaq_decompress(
     unsigned char *s_buf,
     int64_t *d_len,
     const unsigned char *c_buf,
@@ -8390,14 +8440,25 @@ void zpaq_decompress(
     void *userdata,
     int64_t thread
 ) {
+  try {
     libzpaq::StringBuffer in, out;
     in.write((const char*)c_buf, c_len);
-    
+
     libzpaq::decompress(&in, &out);
-    
+
     int64_t out_len = out.size();
     memcpy(s_buf, out.data(), out_len);
     *d_len = out_len;
+    return 0;
+  }
+  catch (const std::bad_alloc&) {
+    fprintf(stderr, "libzpaq error: Out of memory\n");
+    fprintf(stderr, "  hint: out of memory - retry with fewer threads (-t 8) "
+                    "or smaller zpaq blocks (--zpaqbs 32)\n");
+    return 1;
+  }
+  catch (const std::exception& e) { return zpaq_report_error(e); }
+  catch (...) { fprintf(stderr, "libzpaq error: unknown exception\n"); return 2; }
 }
 
 } // extern "C"
