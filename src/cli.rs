@@ -101,7 +101,9 @@ pub struct Args {
     #[arg(short = 'q', long = "quiet", default_value_t = false)]
     pub quiet: bool,
 
-    /// Set compression level (1-9)
+    /// Set compression level (1-9). Defaults to 7 (parity with C++ lrzip-next,
+    /// whose default is level 7). With the zpaq backend, 1-5 map to the
+    /// built-in libzpaq models and 6-9 expand to the level-5 model.
     #[arg(short = 'L', long = "level", value_name = "LEVEL")]
     pub level: Option<u8>,
 

@@ -676,7 +676,7 @@ pub fn compress(args: &Args) -> Result<()> {
     let requested_threads = args
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-    let level_for_est = args.level.unwrap_or(3);
+    let level_for_est = args.level.unwrap_or(7);
     let total_ram = crate::mem::total_memory_bytes();
     let (threads, auto_zpaqbs) = crate::mem::memory_safe_threads(
         requested_threads,
@@ -739,7 +739,8 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::Gzip => BackendProps::Zstd { level: 3 },
             Backend::Zstd => BackendProps::Zstd { level: 3 },
             // Header level: explicit -L wins; else derive from --method's
-            // leading digit when present; else default 3.
+            // leading digit when present; else default 7 (parity with the
+            // C++ lrzip-next default, which is level 7 -> zpaq 4+).
             Backend::Zpaq => BackendProps::Zpaq {
                 level: args.level.unwrap_or_else(|| {
                     args.method
@@ -747,7 +748,7 @@ pub fn compress(args: &Args) -> Result<()> {
                         .and_then(|m| m.chars().next())
                         .and_then(|c| c.to_digit(10))
                         .map(|l| l as u8)
-                        .unwrap_or(3)
+                        .unwrap_or(7)
                 }),
                 // Block size code = log2(MiB), capped at 15 (byte 18's low
                 // nibble). 0 = default (one block per input chunk). The
@@ -1006,7 +1007,7 @@ fn compress_chunk_to_buffer(
             if let Some(method) = &args.method {
                 crate::zpaq::compress_method(&control_stream, method, None, std::ptr::null_mut())?
             } else {
-                crate::zpaq::compress(&control_stream, args.level.unwrap_or(3), None, std::ptr::null_mut())?
+                crate::zpaq::compress(&control_stream, args.level.unwrap_or(7), None, std::ptr::null_mut())?
             }
         }
         Backend::Bzip2 => {
@@ -1016,7 +1017,7 @@ fn compress_chunk_to_buffer(
         }
         Backend::Bzip3 => control_stream.clone(),
         Backend::Lzo => {
-            lzo_compress_level(&control_stream, args.level.unwrap_or(3))?
+            lzo_compress_level(&control_stream, args.level.unwrap_or(7))?
         }
         Backend::None => control_stream.clone(),
     };
@@ -1049,7 +1050,7 @@ fn compress_chunk_to_buffer(
             encoder.finish()?
         }
         Backend::Zpaq => {
-            let requested = args.level.unwrap_or(3);
+            let requested = args.level.unwrap_or(7);
             let eff = effective_level(&literal_stream, requested, args.auto_level);
             if let Some(method) = &args.method {
                 crate::zpaq::compress_method(&literal_stream, method, None, std::ptr::null_mut())?
@@ -1066,7 +1067,7 @@ fn compress_chunk_to_buffer(
         }
         Backend::Bzip3 => literal_stream.clone(),
         Backend::Lzo => {
-            lzo_compress_level(&literal_stream, args.level.unwrap_or(3))?
+            lzo_compress_level(&literal_stream, args.level.unwrap_or(7))?
         }
         Backend::None => literal_stream.clone(),
     };
