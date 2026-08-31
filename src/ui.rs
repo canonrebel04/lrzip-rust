@@ -102,11 +102,26 @@ pub fn print_summary(
         );
     };
 
-    let orig_raw = format_size(original_size);
-    row("Original Size:", &orig_raw, orig_raw.cyan().bold());
+    // Labels depend on direction: compression shows original -> final;
+    // decompression shows compressed (input .lrz) -> decompressed (output).
+    let (first_label, second_label) = if action == "Decompression" {
+        ("Compressed Size:", "Decompressed Size:")
+    } else {
+        ("Original Size:", "Final Size:")
+    };
 
-    let final_raw = format_size(compressed_size);
-    row("Final Size:", &final_raw, final_raw.cyan().bold());
+    // For decompression the (original, compressed) params map to
+    // (decompressed output, compressed .lrz input) — display them in the
+    // other order so the box reads top-down like the pipeline ran.
+    let (first_raw, second_raw) = if action == "Decompression" {
+        (format_size(compressed_size), format_size(original_size))
+    } else {
+        (format_size(original_size), format_size(compressed_size))
+    };
+
+    row(first_label, &first_raw, first_raw.cyan().bold());
+
+    row(second_label, &second_raw, second_raw.cyan().bold());
 
     let ratio_raw = format!("{:.2}x", ratio);
     row("Ratio:", &ratio_raw, ratio_raw.green().bold());

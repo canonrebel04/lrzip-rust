@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -136,13 +137,16 @@ pub fn decompress(args: &Args) -> Result<()> {
     }
 
     let output_path = args.output.clone().unwrap_or_else(|| {
-        let mut p = args.input.clone();
-        if p.extension().map_or(false, |ext| ext == "lrz") {
-            p.set_extension("");
+        // Strip exactly one ".lrz" suffix ("file.bin.lrz" -> "file.bin");
+        // anything else decompresses to <input>.out.
+        let s = args.input.to_string_lossy();
+        if s.len() > 4 && s.ends_with(".lrz") {
+            PathBuf::from(&s[..s.len() - 4])
         } else {
+            let mut p = args.input.clone();
             p.set_extension("out");
+            p
         }
-        p
     });
 
     let start_time = Instant::now();
@@ -653,9 +657,11 @@ pub fn compress(args: &Args) -> Result<()> {
 
 
     let output_path = args.output.clone().unwrap_or_else(|| {
-        let mut p = args.input.clone();
-        p.set_extension("lrz");
-        p
+        // Convention (matches lrzip): output is <input>.lrz — APPEND the
+        // extension rather than replacing the input's own one, so "file.bin"
+        // compresses to "file.bin.lrz" (Path::set_extension would clobber
+        // ".bin" and produce "file.lrz").
+        PathBuf::from(format!("{}.lrz", args.input.display()))
     });
 
     let mut out_file = File::create(&output_path)
