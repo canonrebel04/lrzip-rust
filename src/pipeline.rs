@@ -404,7 +404,20 @@ fn decompress_chunk(
                     other => bail!("unsupported block ctype {}", other),
 
                 };
-                stream_buf.extend_from_slice(&decompressed);
+                // next's read_stream consumes EXACTLY block.uncompressed_len bytes per
+                // block; some lzma streams decode with a trailing extra byte, which
+                // would shift everything in multi-block streams. Trim to u_len.
+                let ul = block.uncompressed_len as usize;
+                if decompressed.len() > ul {
+                    eprintln!(
+                        "Warning: block decoded to {} bytes, trimming to u_len {}",
+                        decompressed.len(),
+                        ul
+                    );
+                    stream_buf.extend_from_slice(&decompressed[..ul]);
+                } else {
+                    stream_buf.extend_from_slice(&decompressed);
+                }
             }
         }
         streams_data.push(stream_buf);
@@ -458,13 +471,16 @@ fn decompress_chunk(
             out.extend_from_slice(slice);
             hasher.update(slice);
             lit_cursor = end;
-        } else if t == 1 {
+        } else {
             // Match
             let chunk_bytes = rcd.chunk_bytes as usize;
             let mut offset_bytes = [0u8; 8];
             offset_bytes[..chunk_bytes].copy_from_slice(&control_stream[ctrl_cursor..ctrl_cursor + chunk_bytes]);
             ctrl_cursor += chunk_bytes;
             let offset = u64::from_le_bytes(offset_bytes) as usize;
+            if std::env::var("LRZIP_DEBUG_OPS").is_ok() {
+                eprintln!("R-OP t=1 len={} ofs={} pos={}", len, offset, out.len());
+            }
             
             let current_pos = out.len();
             if offset > current_pos {
@@ -472,13 +488,23 @@ fn decompress_chunk(
             }
             
             let start = current_pos - offset;
-            for i in 0..len {
-                let val = out[start + i];
-                out.push(val);
-                hasher.update(&[val]);
+            // lrzip-next semantics (runzip.c unzip_match): the match source is a
+            // FIXED block of min(len, offset) bytes read once, repeated cyclically
+            // when len > offset — NOT an LZ77-style expanding window copy.
+            if len <= offset {
+                let slice = out[start..start + len].to_vec();
+                hasher.update(&slice);
+                out.extend_from_slice(&slice);
+            } else {
+                let block = out[start..start + offset].to_vec();
+                let mut remaining = len;
+                while remaining > 0 {
+                    let n = remaining.min(offset);
+                    out.extend_from_slice(&block[..n]);
+                    remaining -= n;
+                }
+                hasher.update(&out[current_pos..current_pos + len]);
             }
-        } else {
-            bail!("unknown rzip control type {}", t);
         }
     }
 
