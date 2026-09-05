@@ -713,7 +713,9 @@ pub fn compress(args: &Args) -> Result<()> {
     // Prepare Magic Header
     let magic = MagicHeader {
         major: 0,
-        minor: 15,
+        // version 0.14 + MD5: last combo lrzip-next 0.15.0 accepts
+        // (next's get_magic switch tops out at minor 14, MAXHASH=13, no Blake3)
+        minor: 14,
         expected_size: Some(total_size),
         encryption: if let Some(_password) = &args.encrypt {
              let mut salt = [0u8; 8];
@@ -725,7 +727,7 @@ pub fn compress(args: &Args) -> Result<()> {
         } else {
             None
         },
-        hash: HashKind::Blake3,
+        hash: HashKind::Md5,
         filter: match args.filter {
             crate::cli::Filter::X86 => FilterSpec::Bcj(BcjFilter::X86),
             crate::cli::Filter::None => FilterSpec::None,
@@ -741,7 +743,7 @@ pub fn compress(args: &Args) -> Result<()> {
             Backend::None => CompressionType::None,
         },
         backend_props: match args.get_backend() {
-            Backend::Lzma => BackendProps::Lzma { dict_prop: 0x2d },
+            Backend::Lzma => BackendProps::Lzma { dict_prop: 26 }, // lzma2 prop code for 32MB dict (0x2d=45 is invalid: >40)
             Backend::Gzip => BackendProps::Zstd { level: 3 },
             Backend::Zstd => BackendProps::Zstd { level: 3 },
             // Header level: explicit -L wins; else derive from --method's
@@ -807,7 +809,9 @@ pub fn compress(args: &Args) -> Result<()> {
     // dominates startup, hence the progress bar above. Slice-consume so the
     // bar advances instead of stalling silently. (BLAKE3: 256-bit output,
     // cryptographically sound, ~2-8 GB/s vs MD5's ~0.6-1 GB/s.)
-    let mut file_hash = blake3::Hasher::new();
+    // File hash must match magic.hash (MD5): lrzip-next reads exactly
+    // hash_len bytes as the trailer, so always write hash_len bytes.
+    let mut file_hash = FileHash::new(HashKind::Md5).expect("md5 hash");
     const HASH_SLICE: usize = 64 * 1024 * 1024;
     let mut off = 0usize;
     while off < bytes.len() {
@@ -854,7 +858,7 @@ pub fn compress(args: &Args) -> Result<()> {
     pb.finish_with_message("Compression complete");
 
     if !args.benchmark {
-        out_file.write_all(file_hash.finalize().as_bytes())?;
+        out_file.write_all(&file_hash.finalize())?;
     }
 
 
@@ -1082,6 +1086,21 @@ fn compress_chunk_to_buffer(
 
     let mut control_compressed = control_compressed;
     let mut literal_compressed = literal_compressed;
+    let mut s0_ctype = s0_ctype;
+    let mut s1_ctype = s1_ctype;
+    // lrzip-next compatibility: a block must never store c_len > u_len.
+    // The C get_fileinfo validation walk assumes compressed data fits within
+    // the archive; lzma/gzip expansion on incompressible streams breaks its
+    // "ofs >= infile_size - hash_len" termination check ("Invalid chunk bytes").
+    // Fall back to CTYPE_NONE when a backend expanded the stream.
+    if control_compressed.len() as u64 > control_stream.len() as u64 {
+        control_compressed = control_stream.clone();
+        s0_ctype = crate::format::CTYPE_NONE;
+    }
+    if literal_compressed.len() as u64 > literal_stream.len() as u64 {
+        literal_compressed = literal_stream.clone();
+        s1_ctype = crate::format::CTYPE_NONE;
+    }
     // s0_ctype/s1_ctype do not need modification for encryption wrapper
 
     // Encrypt if requested
